@@ -3300,12 +3300,12 @@ async function showReminderPicker(runId, context) {
 
     const subtitle = document.createElement("div");
     subtitle.id = "gem-reminder-picker-subtitle";
-    subtitle.textContent = "What do you want to be reminded about?";
+    subtitle.textContent = "Add an optional reminder note and choose a due date.";
 
     const noteLabel = document.createElement("label");
     noteLabel.className = "gem-reminder-picker-label";
     noteLabel.setAttribute("for", "gem-reminder-picker-note");
-    noteLabel.textContent = "Reminder";
+    noteLabel.textContent = "Reminder (optional)";
 
     const noteInput = document.createElement("textarea");
     noteInput.id = "gem-reminder-picker-note";
@@ -3586,11 +3586,6 @@ async function showReminderPicker(runId, context) {
       const dateFromInput = String(dateInput.value || "").trim();
       if (dateFromInput) {
         setSelectedDate(dateFromInput);
-      }
-      if (!note) {
-        setError("Reminder text is required.");
-        noteInput.focus();
-        return;
       }
       if (!selectedDate) {
         setError("Please choose a due date.");

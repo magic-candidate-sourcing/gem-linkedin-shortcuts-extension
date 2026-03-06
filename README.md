@@ -14,7 +14,7 @@ From a LinkedIn profile page (`https://www.linkedin.com/in/...`), the extension 
 6. Set a Gem custom field value.
 7. Add note to candidate in Gem.
 8. Manage candidate emails (add email, copy primary email, view/copy all, set primary).
-9. Set a reminder (note + due date).
+9. Set a reminder (due date + optional note).
 10. Open sequence in Gem UI.
 11. Edit sequence in Gem UI.
 
