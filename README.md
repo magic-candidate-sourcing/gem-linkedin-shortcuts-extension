@@ -1,8 +1,16 @@
 # Gem LinkedIn Shortcuts Extension
 
-Chrome extension + backend service that lets you run Gem and Ashby workflows from LinkedIn profile pages using keyboard shortcuts or popup buttons.
+Chrome extension + backend service that lets you run Gem and Ashby workflows using keyboard shortcuts or popup buttons.
 
 ## Core capabilities
+
+From any website (except `https://reflect.app/*`), the extension now provides:
+
+1. `Gem actions` launcher (`Cmd+K` by default) with:
+   - Create project
+   - Search project + navigate
+   - Create sequence
+   - Search someone in Gem
 
 From a LinkedIn profile page (`https://www.linkedin.com/in/...`), the extension can:
 
@@ -126,6 +134,7 @@ Expected response:
 
 ### 5. Default shortcut map:
 
+- `Cmd+K` Gem actions
 - `Cmd+Option+1` Add Prospect
 - `Cmd+Option+2` Add to Project
 - `Cmd+Option+3` Upload to Ashby

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Gem LinkedIn Shortcuts",
   "version": "0.1.0",
-  "description": "Run Gem actions from LinkedIn profiles with configurable keyboard shortcuts.",
+  "description": "Run Gem actions from anywhere with configurable keyboard shortcuts.",
   "permissions": [
     "storage",
     "tabs"
@@ -40,8 +40,10 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.linkedin.com/*",
-        "https://github.com/*"
+        "<all_urls>"
+      ],
+      "exclude_matches": [
+        "https://reflect.app/*"
       ],
       "js": [
         "src/shared.js",
@@ -55,8 +57,6 @@
         "https://app.gem.com/*"
       ],
       "js": [
-        "src/shared.js",
-        "src/content.js",
         "src/gem_content.js"
       ],
       "run_at": "document_idle"

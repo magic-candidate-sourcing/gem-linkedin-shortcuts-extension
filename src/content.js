@@ -48,11 +48,11 @@ const GEM_ACTION_ACCESS_OPTIONS = [
 const GEM_ACTION_MENU_OPTIONS = [
   { key: "c", id: "createProject", title: "Create project", subtitle: "Create a new Gem project." },
   { key: "p", id: "openProject", title: "Search project + open", subtitle: "Open an existing project or create one if missing." },
-  { key: "s", id: "createSequence", title: "Create sequence", subtitle: "Open Gem sequence creation with name input focused." },
+  { key: "s", id: "createSequence", title: "Create sequence", subtitle: "Open Gem sequences page." },
   { key: "k", id: "searchPerson", title: "Search someone in Gem", subtitle: "Search candidates and open Gem or LinkedIn profile." }
 ];
 const GEM_ACTION_PEOPLE_SEARCH_DEBOUNCE_MS = 140;
-const GEM_ACTION_PEOPLE_SEARCH_LIMIT = 50;
+const GEM_ACTION_PEOPLE_SEARCH_LIMIT = 20;
 const customFieldMemoryCache = new Map();
 const customFieldWarmPromises = new Map();
 const candidateEmailMemoryCache = new Map();
@@ -5492,13 +5492,8 @@ function buildGemProjectUrl(projectId, projectName = "") {
   return `https://www.gem.com/projects/${segment}`;
 }
 
-function buildGemSequenceCreateUrl(runId = "") {
-  const parsed = new URL("https://www.gem.com/sequences/new");
-  parsed.searchParams.set("glsAction", "focusSequenceName");
-  if (runId) {
-    parsed.searchParams.set("glsRunId", runId);
-  }
-  return parsed.toString();
+function buildGemSequenceCreateUrl() {
+  return "https://www.gem.com/sequences";
 }
 
 function normalizeGemProjectPrivacyType(value) {
@@ -5890,6 +5885,7 @@ async function showGemProjectCreateForm(runId, options = {}) {
         item.addEventListener("click", () => {
           selectedAccessIndex = index;
           renderAccessList();
+          item.focus({ preventScroll: true });
         });
         item.addEventListener("focus", () => {
           selectedAccessIndex = index;
@@ -5955,6 +5951,24 @@ async function showGemProjectCreateForm(runId, options = {}) {
       confirmVisible = false;
       updateConfirmation();
       nameInput.focus();
+    }
+
+    function isEditableTarget(node) {
+      if (!node || typeof node !== "object") {
+        return false;
+      }
+      const tagName = String(node.tagName || "").toLowerCase();
+      if (node.isContentEditable) {
+        return true;
+      }
+      if (tagName === "textarea") {
+        return true;
+      }
+      if (tagName !== "input") {
+        return false;
+      }
+      const type = String(node.type || "").toLowerCase();
+      return !["checkbox", "radio", "button", "submit", "reset", "file", "range", "color"].includes(type);
     }
 
     async function confirmCreation() {
@@ -6037,9 +6051,7 @@ async function showGemProjectCreateForm(runId, options = {}) {
         if (event.metaKey || event.ctrlKey || event.altKey) {
           return;
         }
-        const targetTag = String(event.target?.tagName || "").toLowerCase();
-        const isTextEntryTarget =
-          Boolean(event.target?.isContentEditable) || targetTag === "input" || targetTag === "textarea";
+        const isTextEntryTarget = isEditableTarget(event.target);
         const key = String(event.key || "").trim().toLowerCase();
         const accessIndex = GEM_ACTION_ACCESS_OPTIONS.findIndex((option) => option.key === key);
         if (accessIndex >= 0) {
@@ -6789,7 +6801,7 @@ async function handleGemActionsShortcut(source = "keyboard", runId = "") {
       showToast("Action cancelled.", true);
       return;
     }
-    const url = buildGemSequenceCreateUrl(effectiveRunId);
+    const url = buildGemSequenceCreateUrl();
     await openGemNavigation(url, effectiveRunId, {
       actionId: ACTIONS.GEM_ACTIONS,
       openInBackground: false

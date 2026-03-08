@@ -63,6 +63,20 @@ const ASHBY_JOBS_SCAN_MAX = Number(process.env.ASHBY_JOBS_SCAN_MAX || 5000);
 const ASHBY_CANDIDATES_SCAN_MAX = Number(process.env.ASHBY_CANDIDATES_SCAN_MAX || 100000);
 const GEM_CANDIDATE_LOOKUP_SCAN_MAX = Number(process.env.GEM_CANDIDATE_LOOKUP_SCAN_MAX || 5000);
 const GEM_LINKEDIN_URL_LOOKUP_TTL_MS = Number(process.env.GEM_LINKEDIN_URL_LOOKUP_TTL_MS || 10 * 60 * 1000);
+const GEM_CANDIDATE_SEARCH_SCAN_MAX = Number(process.env.GEM_CANDIDATE_SEARCH_SCAN_MAX || 50000);
+const GEM_CANDIDATE_SEARCH_TTL_MS = Number(process.env.GEM_CANDIDATE_SEARCH_TTL_MS || 15 * 60 * 1000);
+const GEM_CANDIDATE_SEARCH_PROBE_MAX_PAGES = Number(process.env.GEM_CANDIDATE_SEARCH_PROBE_MAX_PAGES || 8);
+const GEM_CANDIDATE_SEARCH_PROBE_PARALLEL = Number(process.env.GEM_CANDIDATE_SEARCH_PROBE_PARALLEL || 8);
+const GEM_CANDIDATE_SEARCH_PROBE_MIN_STRONG_MATCHES = Number(
+  process.env.GEM_CANDIDATE_SEARCH_PROBE_MIN_STRONG_MATCHES || 3
+);
+const GEM_CANDIDATE_SEARCH_NAME_QUERY_MAX_PAGES = Number(process.env.GEM_CANDIDATE_SEARCH_NAME_QUERY_MAX_PAGES || 40);
+const GEM_CANDIDATE_SEARCH_REFRESH_PARALLEL = Number(process.env.GEM_CANDIDATE_SEARCH_REFRESH_PARALLEL || 8);
+const GEM_CANDIDATE_SEARCH_PROBE_EMPTY_QUERY_MAX_PAGES = Number(
+  process.env.GEM_CANDIDATE_SEARCH_PROBE_EMPTY_QUERY_MAX_PAGES || 1
+);
+const GEM_CANDIDATE_SEARCH_QUERY_PROBE_TTL_MS = Number(process.env.GEM_CANDIDATE_SEARCH_QUERY_PROBE_TTL_MS || 60 * 1000);
+const GEM_CANDIDATE_SEARCH_QUERY_PROBE_CACHE_MAX = Number(process.env.GEM_CANDIDATE_SEARCH_QUERY_PROBE_CACHE_MAX || 150);
 const ASHBY_CANDIDATE_INDEX_TTL_MS = Number(process.env.ASHBY_CANDIDATE_INDEX_TTL_MS || 10 * 60 * 1000);
 const ASHBY_WRITE_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.ASHBY_WRITE_ENABLED || "false").trim());
 const ASHBY_WRITE_REQUIRE_CONFIRMATION = !/^(0|false|no|off)$/i.test(
@@ -103,6 +117,15 @@ let gemLinkedInUrlLookupCache = {
   urlToCandidateIds: {}
 };
 let gemLinkedInUrlLookupRefreshPromise = null;
+let gemCandidateSearchCache = {
+  builtAtMs: 0,
+  builtAt: "",
+  scannedCount: 0,
+  isComplete: false,
+  candidates: []
+};
+let gemCandidateSearchRefreshPromise = null;
+const gemCandidateSearchProbeHistory = new Map();
 
 function generateId() {
   return crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1363,6 +1386,67 @@ async function addCandidateToProject(payload, audit) {
   }
 }
 
+function slugifyGemProjectName(name) {
+  return String(name || "")
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+}
+
+function buildGemProjectUrl(projectId, projectName = "") {
+  const id = String(projectId || "").trim();
+  if (!id) {
+    return "";
+  }
+  const slug = slugifyGemProjectName(projectName);
+  const segment = slug ? `${slug}--${id}` : id;
+  return `https://www.gem.com/projects/${segment}`;
+}
+
+async function createProject(payload, audit) {
+  const name = String(payload?.name || "").trim();
+  if (!name) {
+    throw new Error("Project name is required.");
+  }
+  const description = String(payload?.description || "").trim();
+  const requestedPrivacy = normalizeTextToken(payload?.privacyType || payload?.privacy_type || "");
+  const privacyType = ["shared", "personal", "confidential"].includes(requestedPrivacy) ? requestedPrivacy : "shared";
+  const userId = await resolveCreatedByUserId(payload?.userId, payload?.userEmail, audit);
+  if (!userId) {
+    throw new Error(
+      "Gem requires project.user_id. Set createdByUserEmail or createdByUserId in extension options, or set GEM_DEFAULT_USER_ID/GEM_DEFAULT_USER_EMAIL in backend env."
+    );
+  }
+
+  const body = omitUndefined({
+    user_id: userId,
+    name,
+    description: description || undefined,
+    privacy_type: privacyType
+  });
+  const project = await gemRequest(
+    "/v0/projects",
+    {
+      method: "POST",
+      body
+    },
+    audit
+  );
+
+  return {
+    project: {
+      id: String(project?.id || "").trim(),
+      name: String(project?.name || name).trim(),
+      privacyType: String(project?.privacy_type || privacyType).trim(),
+      description: String(project?.description || description).trim(),
+      url: buildGemProjectUrl(project?.id, project?.name || name)
+    }
+  };
+}
+
 async function listProjects(payload, audit) {
   const requestedLimitRaw = Number(payload.limit);
   const requestedLimit =
@@ -2006,6 +2090,789 @@ async function listUsers(payload, audit) {
   return { users };
 }
 
+function getGemCandidateSearchAgeMs(cache = gemCandidateSearchCache) {
+  if (!cache?.builtAtMs) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.max(0, Date.now() - Number(cache.builtAtMs));
+}
+
+function isGemCandidateSearchFresh(cache = gemCandidateSearchCache) {
+  return getGemCandidateSearchAgeMs(cache) <= GEM_CANDIDATE_SEARCH_TTL_MS;
+}
+
+function extractGemCandidateSchool(candidate) {
+  const direct = firstNonEmpty(candidate?.school);
+  if (direct) {
+    return direct;
+  }
+  const education = Array.isArray(candidate?.education_info) ? candidate.education_info : [];
+  for (const item of education) {
+    const school = firstNonEmpty(item?.school, item?.parsed_school, item?.university, item?.parsed_university);
+    if (school) {
+      return school;
+    }
+  }
+  return "";
+}
+
+function buildGemCandidateSearchSummary(candidate) {
+  const id = String(candidate?.id || "").trim();
+  if (!id) {
+    return null;
+  }
+  const structuredName = `${String(candidate?.first_name || "").trim()} ${String(candidate?.last_name || "").trim()}`.trim();
+  const fullName = firstNonEmpty(candidate?.name, structuredName);
+  const alternateName = normalizeTextToken(structuredName) === normalizeTextToken(fullName) ? "" : structuredName;
+  const primaryEmail = extractGemCandidateEmail(candidate);
+  const company = firstNonEmpty(candidate?.company);
+  const title = firstNonEmpty(candidate?.title);
+  const school = extractGemCandidateSchool(candidate);
+  const gemProfileUrl = firstNonEmpty(candidate?.weblink, candidate?.profile_url);
+  const linkedInUrl = extractGemCandidateLinkedInUrl(candidate);
+  const updatedAtRaw = firstNonEmpty(candidate?.last_updated_at, candidate?.updated_at, candidate?.created_at);
+  const updatedAtMs = toEpochMs(updatedAtRaw);
+  const updatedAt = updatedAtMs > 0 ? new Date(updatedAtMs).toISOString() : "";
+  const normalizedFullName = normalizeTextToken(fullName);
+  const normalizedEmail = normalizeTextToken(primaryEmail);
+  const normalizedEmailLocal = normalizeTextToken(String(primaryEmail || "").split("@")[0] || "");
+  const normalizedCompany = normalizeTextToken(company);
+  const normalizedTitle = normalizeTextToken(title);
+  const normalizedSchool = normalizeTextToken(school);
+  const normalizedLinkedInUrl = normalizeTextToken(linkedInUrl);
+  const normalizedAlternateName = normalizeTextToken(alternateName);
+  const searchText = normalizeTextToken(
+    [
+      normalizedFullName,
+      normalizedAlternateName,
+      normalizedEmail,
+      normalizedCompany,
+      normalizedTitle,
+      normalizedSchool,
+      normalizedLinkedInUrl
+    ].join(" ")
+  );
+  const nameTokens = tokenizeNameText(`${normalizedFullName} ${normalizedAlternateName}`);
+  const emailTokens = tokenizeNameText(`${normalizedEmail} ${normalizedEmailLocal}`);
+  const profileTokens = tokenizeNameText(`${normalizedCompany} ${normalizedTitle} ${normalizedSchool} ${normalizedLinkedInUrl}`);
+
+  return {
+    id,
+    fullName,
+    primaryEmail,
+    company,
+    title,
+    school,
+    gemProfileUrl,
+    linkedInUrl,
+    updatedAt,
+    updatedAtMs,
+    searchText,
+    normalizedFullName,
+    normalizedEmail,
+    normalizedEmailLocal,
+    normalizedCompany,
+    normalizedTitle,
+    normalizedSchool,
+    normalizedLinkedInUrl,
+    nameTokens,
+    emailTokens,
+    profileTokens
+  };
+}
+
+async function refreshGemCandidateSearchIndex(audit) {
+  const configuredScanLimit = Number.isFinite(Number(GEM_CANDIDATE_SEARCH_SCAN_MAX))
+    ? Number(GEM_CANDIDATE_SEARCH_SCAN_MAX)
+    : 0;
+  const scanLimit = configuredScanLimit > 0 ? Math.min(configuredScanLimit, 50000) : 0;
+  if (scanLimit <= 0) {
+    return gemCandidateSearchCache;
+  }
+  const pageSize = 100;
+  const maxPages = Math.max(1, Math.ceil(scanLimit / pageSize));
+  const parallelRaw = Number(GEM_CANDIDATE_SEARCH_REFRESH_PARALLEL);
+  const parallel = Number.isFinite(parallelRaw) ? Math.max(1, Math.min(Math.trunc(parallelRaw), 12)) : 6;
+  const candidates = [];
+  let nextPage = 1;
+  let reachedLastPage = false;
+
+  while (nextPage <= maxPages && !reachedLastPage && candidates.length < scanLimit) {
+    const pages = [];
+    for (let i = 0; i < parallel && nextPage <= maxPages; i += 1) {
+      pages.push(nextPage);
+      nextPage += 1;
+    }
+    if (pages.length === 0) {
+      break;
+    }
+
+    const batch = await Promise.all(pages.map((page) => fetchGemCandidateSearchPage(page, pageSize, audit)));
+    for (const result of batch) {
+      if (result.error) {
+        throw result.error;
+      }
+      const rows = Array.isArray(result.rows) ? result.rows : [];
+      if (result.notFound || rows.length < pageSize) {
+        reachedLastPage = true;
+      }
+      for (const row of rows) {
+        candidates.push(row);
+        if (candidates.length >= scanLimit) {
+          break;
+        }
+      }
+      if (candidates.length >= scanLimit) {
+        break;
+      }
+    }
+  }
+
+  const seen = new Set();
+  const normalized = [];
+  for (const candidate of candidates) {
+    const summary = buildGemCandidateSearchSummary(candidate);
+    if (!summary || seen.has(summary.id)) {
+      continue;
+    }
+    seen.add(summary.id);
+    normalized.push(summary);
+  }
+
+  gemCandidateSearchCache = {
+    builtAtMs: Date.now(),
+    builtAt: new Date().toISOString(),
+    scannedCount: Array.isArray(candidates) ? candidates.length : 0,
+    isComplete: Array.isArray(candidates) ? candidates.length < scanLimit : false,
+    candidates: normalized
+  };
+
+  logEvent({
+    source: "backend",
+    event: "gem.candidate_search_index.refreshed",
+    message: "Refreshed Gem candidate search index.",
+    requestId: audit.requestId,
+    route: audit.route,
+    runId: audit.runId,
+    actionId: audit.actionId,
+    details: {
+      scanLimit,
+      scannedCount: gemCandidateSearchCache.scannedCount,
+      candidateCount: normalized.length,
+      isComplete: gemCandidateSearchCache.isComplete
+    }
+  });
+
+  return gemCandidateSearchCache;
+}
+
+function ensureGemCandidateSearchIndex(audit, options = {}) {
+  const forceRefresh = Boolean(options.forceRefresh);
+  if (!forceRefresh && isGemCandidateSearchFresh(gemCandidateSearchCache) && Array.isArray(gemCandidateSearchCache.candidates)) {
+    return Promise.resolve(gemCandidateSearchCache);
+  }
+  if (gemCandidateSearchRefreshPromise) {
+    return gemCandidateSearchRefreshPromise;
+  }
+  gemCandidateSearchRefreshPromise = refreshGemCandidateSearchIndex(audit).finally(() => {
+    gemCandidateSearchRefreshPromise = null;
+  });
+  return gemCandidateSearchRefreshPromise;
+}
+
+function tokenMatchStrength(token, tokens, options = {}) {
+  const normalizedToken = normalizeTextToken(token);
+  if (!normalizedToken || !Array.isArray(tokens) || tokens.length === 0) {
+    return 0;
+  }
+  const allowContains = Boolean(options.allowContains);
+  let best = 0;
+  for (const raw of tokens) {
+    const current = normalizeTextToken(raw);
+    if (!current) {
+      continue;
+    }
+    if (current === normalizedToken) {
+      return 3;
+    }
+    if (current.startsWith(normalizedToken)) {
+      best = Math.max(best, 2);
+      continue;
+    }
+    if (allowContains && current.includes(normalizedToken)) {
+      best = Math.max(best, 1);
+    }
+  }
+  return best;
+}
+
+function isLikelyPersonNameQuery(tokens) {
+  const normalizedTokens = Array.isArray(tokens)
+    ? tokens.map((token) => normalizeTextToken(token)).filter(Boolean)
+    : [];
+  if (normalizedTokens.length === 0 || normalizedTokens.length > 4) {
+    return false;
+  }
+  return normalizedTokens.every((token) => /^[a-z][a-z'-]{1,}$/i.test(token));
+}
+
+function sortGemCandidateSearchRows(left, right) {
+  if (right.score !== left.score) {
+    return right.score - left.score;
+  }
+  const leftUpdatedAt = Number(left.candidate?.updatedAtMs) || 0;
+  const rightUpdatedAt = Number(right.candidate?.updatedAtMs) || 0;
+  if (rightUpdatedAt !== leftUpdatedAt) {
+    return rightUpdatedAt - leftUpdatedAt;
+  }
+  const leftName = String(left.candidate?.fullName || "");
+  const rightName = String(right.candidate?.fullName || "");
+  return leftName.localeCompare(rightName);
+}
+
+function mapGemCandidateSearchResponse(candidate) {
+  return {
+    id: String(candidate?.id || ""),
+    fullName: String(candidate?.fullName || ""),
+    primaryEmail: String(candidate?.primaryEmail || ""),
+    company: String(candidate?.company || ""),
+    title: String(candidate?.title || ""),
+    school: String(candidate?.school || ""),
+    gemProfileUrl: String(candidate?.gemProfileUrl || ""),
+    linkedInUrl: String(candidate?.linkedInUrl || ""),
+    updatedAt: String(candidate?.updatedAt || "")
+  };
+}
+
+function evaluateGemCandidateSearchMatch(candidate, normalizedQuery, queryTokens) {
+  if (!normalizedQuery) {
+    return {
+      score: 1,
+      strongMatch: true
+    };
+  }
+
+  const fullName = normalizeTextToken(candidate?.normalizedFullName || candidate?.fullName);
+  const email = normalizeTextToken(candidate?.normalizedEmail || candidate?.primaryEmail);
+  const emailLocal = normalizeTextToken(
+    candidate?.normalizedEmailLocal || String(candidate?.primaryEmail || "").split("@")[0] || ""
+  );
+  const company = normalizeTextToken(candidate?.normalizedCompany || candidate?.company);
+  const title = normalizeTextToken(candidate?.normalizedTitle || candidate?.title);
+  const school = normalizeTextToken(candidate?.normalizedSchool || candidate?.school);
+  const linkedInUrl = normalizeTextToken(candidate?.normalizedLinkedInUrl || candidate?.linkedInUrl);
+  const nameTokens = Array.isArray(candidate?.nameTokens) ? candidate.nameTokens : tokenizeNameText(fullName);
+  const emailTokens = Array.isArray(candidate?.emailTokens)
+    ? candidate.emailTokens
+    : tokenizeNameText(`${email} ${emailLocal}`);
+  const profileTokens = Array.isArray(candidate?.profileTokens)
+    ? candidate.profileTokens
+    : tokenizeNameText(`${company} ${title} ${school} ${linkedInUrl}`);
+  const isNameQuery = isLikelyPersonNameQuery(queryTokens);
+
+  let score = 0;
+  let strongMatch = false;
+  let allTokensMatched = true;
+
+  if (fullName === normalizedQuery) {
+    score += 520;
+    strongMatch = true;
+  } else if (fullName.startsWith(normalizedQuery)) {
+    score += 420;
+    strongMatch = true;
+  } else if (fullName.includes(` ${normalizedQuery}`)) {
+    score += 280;
+    strongMatch = true;
+  }
+
+  if (emailLocal === normalizedQuery || email === normalizedQuery) {
+    score += 340;
+    strongMatch = true;
+  } else if (emailLocal.startsWith(normalizedQuery)) {
+    score += 260;
+    strongMatch = true;
+  } else if (email.startsWith(normalizedQuery)) {
+    score += 220;
+    strongMatch = true;
+  }
+
+  for (const token of queryTokens) {
+    const normalizedToken = normalizeTextToken(token);
+    if (!normalizedToken) {
+      continue;
+    }
+    let tokenMatched = false;
+    let tokenMatchedByIdentity = false;
+
+    const nameStrength = tokenMatchStrength(normalizedToken, nameTokens, {
+      allowContains: normalizedToken.length >= 4
+    });
+    if (nameStrength === 3) {
+      score += 210;
+      strongMatch = true;
+      tokenMatched = true;
+      tokenMatchedByIdentity = true;
+    } else if (nameStrength === 2) {
+      score += 165;
+      strongMatch = true;
+      tokenMatched = true;
+      tokenMatchedByIdentity = true;
+    } else if (nameStrength === 1) {
+      score += 80;
+      tokenMatched = true;
+      tokenMatchedByIdentity = true;
+    }
+
+    const emailStrength = tokenMatchStrength(normalizedToken, emailTokens, {
+      allowContains: normalizedToken.length >= 4
+    });
+    if (emailStrength === 3) {
+      score += 170;
+      strongMatch = true;
+      tokenMatched = true;
+      tokenMatchedByIdentity = true;
+    } else if (emailStrength === 2) {
+      score += 130;
+      strongMatch = true;
+      tokenMatched = true;
+      tokenMatchedByIdentity = true;
+    } else if (emailStrength === 1) {
+      score += 65;
+      tokenMatched = true;
+      tokenMatchedByIdentity = true;
+    }
+
+    const profileStrength = tokenMatchStrength(normalizedToken, profileTokens, {
+      allowContains: normalizedToken.length >= 5
+    });
+    if (!isNameQuery) {
+      if (profileStrength === 3) {
+        score += 70;
+        tokenMatched = true;
+      } else if (profileStrength === 2) {
+        score += 45;
+        tokenMatched = true;
+      } else if (profileStrength === 1) {
+        score += 20;
+        tokenMatched = true;
+      }
+    } else if (tokenMatchedByIdentity && profileStrength > 0) {
+      // For person-name queries, profile text should influence ranking but not satisfy missing identity tokens.
+      score += profileStrength === 3 ? 18 : profileStrength === 2 ? 10 : 4;
+    }
+
+    if (!tokenMatched) {
+      allTokensMatched = false;
+      break;
+    }
+  }
+
+  if (!allTokensMatched) {
+    return null;
+  }
+
+  if (isNameQuery && queryTokens.length >= 2) {
+    const identityTokenMatches = queryTokens.filter((token) => {
+      const normalizedToken = normalizeTextToken(token);
+      if (!normalizedToken) {
+        return false;
+      }
+      const nameStrength = tokenMatchStrength(normalizedToken, nameTokens, {
+        allowContains: normalizedToken.length >= 4
+      });
+      if (nameStrength >= 2) {
+        return true;
+      }
+      const emailStrength = tokenMatchStrength(normalizedToken, emailTokens, {
+        allowContains: normalizedToken.length >= 4
+      });
+      return emailStrength >= 2;
+    }).length;
+    if (identityTokenMatches < queryTokens.length) {
+      return null;
+    }
+  }
+
+  if (isNameQuery && queryTokens.length === 1) {
+    const token = normalizeTextToken(queryTokens[0]);
+    if (token.length >= 3 && !strongMatch) {
+      const likelyNameOrEmail =
+        nameTokens.some((value) => normalizeTextToken(value).startsWith(token)) ||
+        emailTokens.some((value) => normalizeTextToken(value).startsWith(token));
+      if (!likelyNameOrEmail) {
+        return null;
+      }
+      score = Math.max(1, score - 40);
+    }
+  }
+
+  const updatedAtMs = Number(candidate?.updatedAtMs) || 0;
+  if (updatedAtMs > 0) {
+    const ageDays = (Date.now() - updatedAtMs) / (24 * 60 * 60 * 1000);
+    if (ageDays <= 30) {
+      score += 12;
+    } else if (ageDays <= 180) {
+      score += 6;
+    }
+  }
+
+  if (score <= 0) {
+    return null;
+  }
+
+  return {
+    score,
+    strongMatch
+  };
+}
+
+function searchGemCandidateIndexRowsDetailed(rows, query, limit) {
+  const normalizedQuery = normalizeTextToken(query);
+  const queryTokens = normalizedQuery
+    .split(/\s+/g)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const normalizedRows = Array.isArray(rows) ? rows : [];
+  const strongMatches = [];
+  const weakMatches = [];
+
+  for (const candidate of normalizedRows) {
+    if (!candidate || typeof candidate !== "object" || !candidate.id) {
+      continue;
+    }
+    const evaluated = evaluateGemCandidateSearchMatch(candidate, normalizedQuery, queryTokens);
+    if (!evaluated) {
+      continue;
+    }
+    const entry = {
+      score: Number(evaluated.score) || 0,
+      candidate
+    };
+    if (evaluated.strongMatch) {
+      strongMatches.push(entry);
+    } else {
+      weakMatches.push(entry);
+    }
+  }
+
+  strongMatches.sort(sortGemCandidateSearchRows);
+  weakMatches.sort(sortGemCandidateSearchRows);
+  const merged = strongMatches.concat(weakMatches);
+  const sliced = merged.slice(0, limit);
+
+  return {
+    candidates: sliced.map((entry) => mapGemCandidateSearchResponse(entry.candidate)),
+    strongCount: strongMatches.length
+  };
+}
+
+function searchGemCandidateIndexRows(rows, query, limit) {
+  return searchGemCandidateIndexRowsDetailed(rows, query, limit).candidates;
+}
+
+function shouldSkipGemCandidateQueryProbe(query, maxPages) {
+  const normalizedQuery = normalizeTextToken(query);
+  if (!normalizedQuery) {
+    return false;
+  }
+  const entry = gemCandidateSearchProbeHistory.get(normalizedQuery);
+  if (!entry) {
+    return false;
+  }
+  const ageMs = Date.now() - Number(entry.atMs || 0);
+  if (ageMs > GEM_CANDIDATE_SEARCH_QUERY_PROBE_TTL_MS) {
+    return false;
+  }
+  return Number(entry.maxPages || 0) >= Number(maxPages || 0);
+}
+
+function markGemCandidateQueryProbe(query, maxPages) {
+  const normalizedQuery = normalizeTextToken(query);
+  if (!normalizedQuery) {
+    return;
+  }
+  gemCandidateSearchProbeHistory.set(normalizedQuery, {
+    atMs: Date.now(),
+    maxPages: Number(maxPages) || 0
+  });
+  const maxEntriesRaw = Number(GEM_CANDIDATE_SEARCH_QUERY_PROBE_CACHE_MAX);
+  const maxEntries = Number.isFinite(maxEntriesRaw) ? Math.max(20, Math.min(Math.trunc(maxEntriesRaw), 1000)) : 150;
+  if (gemCandidateSearchProbeHistory.size <= maxEntries) {
+    return;
+  }
+  const removable = gemCandidateSearchProbeHistory.size - maxEntries;
+  let removed = 0;
+  for (const key of gemCandidateSearchProbeHistory.keys()) {
+    gemCandidateSearchProbeHistory.delete(key);
+    removed += 1;
+    if (removed >= removable) {
+      break;
+    }
+  }
+}
+
+function startGemCandidateSearchRefreshInBackground(audit) {
+  ensureGemCandidateSearchIndex(audit, { forceRefresh: true }).catch((error) => {
+    logEvent({
+      level: "warn",
+      source: "backend",
+      event: "gem.candidate_search_index.refresh_failed",
+      message: error?.message || "Gem candidate search index refresh failed.",
+      requestId: audit.requestId,
+      route: audit.route,
+      runId: audit.runId,
+      actionId: audit.actionId
+    });
+  });
+}
+
+async function fetchGemCandidateSearchPage(page, pageSize, audit) {
+  try {
+    const response = await gemRequest(
+      "/v0/candidates",
+      {
+        query: {
+          sort: "desc",
+          page,
+          page_size: pageSize
+        }
+      },
+      audit
+    );
+    return {
+      page,
+      rows: Array.isArray(response) ? response : [],
+      notFound: false
+    };
+  } catch (error) {
+    if (Number(error?.status) === 404 && page > 1) {
+      return {
+        page,
+        rows: [],
+        notFound: true
+      };
+    }
+    return {
+      page,
+      rows: [],
+      notFound: false,
+      error
+    };
+  }
+}
+
+async function probeGemCandidateSearch(query, limit, audit, options = {}) {
+  const normalizedQuery = normalizeTextToken(query);
+  const queryTokens = normalizedQuery
+    .split(/\s+/g)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const isNameQuery = isLikelyPersonNameQuery(queryTokens);
+  const requestedMaxPagesRaw = Number(options.maxPages);
+  const defaultMaxPages = normalizedQuery
+    ? isNameQuery
+      ? GEM_CANDIDATE_SEARCH_NAME_QUERY_MAX_PAGES
+      : GEM_CANDIDATE_SEARCH_PROBE_MAX_PAGES
+    : GEM_CANDIDATE_SEARCH_PROBE_EMPTY_QUERY_MAX_PAGES;
+  const maxPagesSource = Number.isFinite(requestedMaxPagesRaw) && requestedMaxPagesRaw > 0 ? requestedMaxPagesRaw : defaultMaxPages;
+  const maxPages = Number.isFinite(Number(maxPagesSource)) ? Math.max(1, Math.min(Math.trunc(Number(maxPagesSource)), 500)) : 1;
+  const parallelPagesRaw = Number(GEM_CANDIDATE_SEARCH_PROBE_PARALLEL);
+  const parallelPages = Number.isFinite(parallelPagesRaw)
+    ? Math.max(1, Math.min(Math.trunc(parallelPagesRaw), 8))
+    : 2;
+  const minStrongRaw = Number(options.minStrongMatches || GEM_CANDIDATE_SEARCH_PROBE_MIN_STRONG_MATCHES);
+  const minStrongMatches = Number.isFinite(minStrongRaw)
+    ? Math.max(1, Math.min(Math.trunc(minStrongRaw), limit))
+    : Math.max(1, Math.min(limit, 8));
+  const pageSize = 100;
+  const summaries = [];
+  const seenCandidateIds = new Set();
+  let nextPage = 1;
+  let reachedLastPage = false;
+
+  while (nextPage <= maxPages && !reachedLastPage) {
+    const pages = [];
+    for (let i = 0; i < parallelPages && nextPage <= maxPages; i += 1) {
+      pages.push(nextPage);
+      nextPage += 1;
+    }
+    if (pages.length === 0) {
+      break;
+    }
+
+    const batch = await Promise.all(pages.map((page) => fetchGemCandidateSearchPage(page, pageSize, audit)));
+    for (const result of batch) {
+      if (result.error) {
+        throw result.error;
+      }
+      const rows = Array.isArray(result.rows) ? result.rows : [];
+      if (result.notFound || rows.length < pageSize) {
+        reachedLastPage = true;
+      }
+      for (const row of rows) {
+        const summary = buildGemCandidateSearchSummary(row);
+        if (!summary || seenCandidateIds.has(summary.id)) {
+          continue;
+        }
+        seenCandidateIds.add(summary.id);
+        summaries.push(summary);
+      }
+    }
+    const currentMatches = searchGemCandidateIndexRowsDetailed(summaries, normalizedQuery, limit);
+    if (!normalizedQuery) {
+      if (currentMatches.candidates.length >= limit) {
+        break;
+      }
+      continue;
+    }
+    if (currentMatches.strongCount >= minStrongMatches || currentMatches.candidates.length >= limit) {
+      break;
+    }
+  }
+
+  const finalMatches = searchGemCandidateIndexRowsDetailed(summaries, normalizedQuery, limit);
+  if (summaries.length > 0) {
+    gemCandidateSearchCache = {
+      builtAtMs: Date.now(),
+      builtAt: new Date().toISOString(),
+      scannedCount: summaries.length,
+      isComplete: false,
+      candidates: summaries
+    };
+  }
+  logEvent({
+    source: "backend",
+    event: "gem.candidate_search.probe_completed",
+    message: "Served Gem candidate search from recent candidate probe.",
+    requestId: audit.requestId,
+    route: audit.route,
+    runId: audit.runId,
+    actionId: audit.actionId,
+    details: {
+      query: normalizedQuery,
+      scannedCandidates: summaries.length,
+      returnedCandidates: finalMatches.candidates.length,
+      strongCount: finalMatches.strongCount,
+      maxPages,
+      parallelPages,
+      nameQuery: isNameQuery
+    }
+  });
+  return finalMatches.candidates;
+}
+
+async function searchCandidates(payload, audit) {
+  const query = String(payload?.query || "").trim();
+  const requestedLimitRaw = Number(payload?.limit);
+  const limit =
+    Number.isFinite(requestedLimitRaw) && requestedLimitRaw > 0
+      ? Math.max(1, Math.min(Math.trunc(requestedLimitRaw), 200))
+      : 25;
+  const forceRefresh = Boolean(payload?.forceRefresh);
+  const normalizedQuery = normalizeTextToken(query);
+  const queryTokens = normalizedQuery
+    .split(/\s+/g)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const isNameQuery = isLikelyPersonNameQuery(queryTokens);
+  const nameQueryMaxPages = isNameQuery
+    ? queryTokens.length >= 2
+      ? GEM_CANDIDATE_SEARCH_NAME_QUERY_MAX_PAGES
+      : Math.max(8, Math.ceil(GEM_CANDIDATE_SEARCH_NAME_QUERY_MAX_PAGES / 2))
+    : GEM_CANDIDATE_SEARCH_PROBE_MAX_PAGES;
+  const nameQueryMinStrongMatches = isNameQuery
+    ? Math.max(3, Math.min(limit, Math.ceil(limit * 0.6)))
+    : Math.max(1, Math.min(limit, GEM_CANDIDATE_SEARCH_PROBE_MIN_STRONG_MATCHES));
+  const nameQueryProbeOptions = isNameQuery
+    ? {
+        maxPages: nameQueryMaxPages,
+        minStrongMatches: nameQueryMinStrongMatches
+      }
+    : {};
+
+  if (forceRefresh) {
+    const refreshed = await ensureGemCandidateSearchIndex(audit, { forceRefresh: true });
+    return {
+      candidates: searchGemCandidateIndexRows(refreshed?.candidates, query, limit)
+    };
+  }
+
+  const cache = gemCandidateSearchCache;
+  const cachedRows = Array.isArray(cache?.candidates) ? cache.candidates : [];
+  const hasCachedRows = cachedRows.length > 0;
+  if (hasCachedRows && isGemCandidateSearchFresh(cache)) {
+    const cachedMatches = searchGemCandidateIndexRowsDetailed(cachedRows, query, limit);
+    if (!cache?.isComplete) {
+      startGemCandidateSearchRefreshInBackground(audit);
+    }
+    const scannedCount = Number(cache?.scannedCount || 0);
+    const probeCoverageCap = nameQueryMaxPages * 100;
+    const alreadyProbedRecently = shouldSkipGemCandidateQueryProbe(query, nameQueryMaxPages);
+    const shouldProbeForAccuracy =
+      normalizedQuery &&
+      scannedCount < probeCoverageCap &&
+      !alreadyProbedRecently &&
+      (cachedMatches.strongCount === 0 || (isNameQuery && cachedMatches.candidates.length < Math.max(4, Math.min(limit, 8))));
+    if (shouldProbeForAccuracy) {
+      try {
+        const probeMatches = await probeGemCandidateSearch(query, limit, audit, nameQueryProbeOptions);
+        markGemCandidateQueryProbe(query, nameQueryMaxPages);
+        if (probeMatches.length > 0) {
+          return {
+            candidates: probeMatches
+          };
+        }
+      } catch (_error) {
+        markGemCandidateQueryProbe(query, nameQueryMaxPages);
+        // Fall back to current cache when probe fails.
+      }
+    }
+    return {
+      candidates: cachedMatches.candidates
+    };
+  }
+
+  if (hasCachedRows) {
+    const cachedMatches = searchGemCandidateIndexRowsDetailed(cachedRows, query, limit);
+    startGemCandidateSearchRefreshInBackground(audit);
+    const scannedCount = Number(cache?.scannedCount || 0);
+    const probeCoverageCap = nameQueryMaxPages * 100;
+    const alreadyProbedRecently = shouldSkipGemCandidateQueryProbe(query, nameQueryMaxPages);
+
+    const shouldProbeForAccuracy =
+      normalizedQuery &&
+      scannedCount < probeCoverageCap &&
+      !alreadyProbedRecently &&
+      (cachedMatches.strongCount === 0 || (isNameQuery && cachedMatches.candidates.length < Math.max(4, Math.min(limit, 8))));
+    if (shouldProbeForAccuracy) {
+      try {
+        const probeMatches = await probeGemCandidateSearch(query, limit, audit, nameQueryProbeOptions);
+        markGemCandidateQueryProbe(query, nameQueryMaxPages);
+        if (probeMatches.length > 0) {
+          return {
+            candidates: probeMatches
+          };
+        }
+      } catch (_error) {
+        markGemCandidateQueryProbe(query, nameQueryMaxPages);
+        // Fall back to stale cache if probe fails.
+      }
+    }
+
+    return {
+      candidates: cachedMatches.candidates
+    };
+  }
+
+  const candidates = await probeGemCandidateSearch(query, limit, audit, nameQueryProbeOptions);
+  markGemCandidateQueryProbe(query, nameQueryMaxPages);
+  startGemCandidateSearchRefreshInBackground(audit);
+
+  return {
+    candidates
+  };
+}
+
 function toEpochMs(value) {
   if (value === null || value === undefined || value === "") {
     return 0;
@@ -2363,8 +3230,9 @@ async function recentLogs(payload) {
 
 function normalizeTextToken(value) {
   return String(value || "")
-    .trim()
-    .toLowerCase();
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function normalizeProfileUrl(value) {
@@ -3596,7 +4464,9 @@ const routes = {
   "/api/candidates/find-by-profile-url": (payload, audit) => findCandidateByProfileUrl(payload, audit),
   "/api/candidates/create-from-linkedin": createCandidateFromLinkedIn,
   "/api/candidates/create-from-context": createCandidateFromContext,
+  "/api/candidates/search": searchCandidates,
   "/api/projects/add-candidate": addCandidateToProject,
+  "/api/projects/create": createProject,
   "/api/projects/list": listProjects,
   "/api/ashby/jobs/list": listAshbyJobs,
   "/api/ashby/candidates/find-by-linkedin": findAshbyCandidateByLinkedIn,
@@ -3775,4 +4645,10 @@ server.listen(PORT, () => {
     },
     { forceFull: false }
   );
+  startGemCandidateSearchRefreshInBackground({
+    requestId: "startup",
+    route: "startup",
+    runId: "",
+    actionId: "gemActions"
+  });
 });
