@@ -61,7 +61,7 @@ const PROJECTS_SCAN_MAX = Number(process.env.PROJECTS_SCAN_MAX || 20000);
 const SEQUENCES_SCAN_MAX = Number(process.env.SEQUENCES_SCAN_MAX || 20000);
 const ASHBY_JOBS_SCAN_MAX = Number(process.env.ASHBY_JOBS_SCAN_MAX || 5000);
 const ASHBY_CANDIDATES_SCAN_MAX = Number(process.env.ASHBY_CANDIDATES_SCAN_MAX || 100000);
-const GEM_CANDIDATE_LOOKUP_SCAN_MAX = Number(process.env.GEM_CANDIDATE_LOOKUP_SCAN_MAX || 0);
+const GEM_CANDIDATE_LOOKUP_SCAN_MAX = Number(process.env.GEM_CANDIDATE_LOOKUP_SCAN_MAX || 5000);
 const GEM_LINKEDIN_URL_LOOKUP_TTL_MS = Number(process.env.GEM_LINKEDIN_URL_LOOKUP_TTL_MS || 10 * 60 * 1000);
 const ASHBY_CANDIDATE_INDEX_TTL_MS = Number(process.env.ASHBY_CANDIDATE_INDEX_TTL_MS || 10 * 60 * 1000);
 const ASHBY_WRITE_ENABLED = /^(1|true|yes|on)$/i.test(String(process.env.ASHBY_WRITE_ENABLED || "false").trim());
@@ -668,23 +668,41 @@ function sanitizeLinkedInHandle(raw) {
   return String(raw || "").trim().replace(/^@/, "");
 }
 
-function getGemCandidateLinkedInKeys(candidate) {
-  const keys = new Set();
-  const addKey = (value) => {
-    const normalized = normalizeLinkedInUrl(value);
-    if (normalized && normalized.includes("linkedin.com/")) {
-      keys.add(normalized);
-    }
-  };
+function sanitizeSocialHandle(raw) {
+  return String(raw || "")
+    .trim()
+    .replace(/^@/, "");
+}
 
+function buildGitHubUrlFromHandle(handle) {
+  const clean = sanitizeSocialHandle(handle);
+  if (!clean) {
+    return "";
+  }
+  return `https://github.com/${encodeURIComponent(clean)}`;
+}
+
+function addGemCandidateLookupKey(keys, value) {
+  const profileKey = normalizeProfileUrl(value);
+  if (profileKey) {
+    keys.add(profileKey);
+  }
+  const linkedInKey = normalizeLinkedInUrl(value);
+  if (linkedInKey && linkedInKey.includes("linkedin.com/")) {
+    keys.add(linkedInKey);
+  }
+}
+
+function getGemCandidateLookupKeys(candidate) {
+  const keys = new Set();
   const handleUrl = buildLinkedInUrlFromHandle(candidate?.linked_in_handle || candidate?.linkedInHandle || "");
   if (handleUrl) {
-    addKey(handleUrl);
+    addGemCandidateLookupKey(keys, handleUrl);
   }
 
   const profileUrls = Array.isArray(candidate?.profile_urls) ? candidate.profile_urls : [];
   for (const url of profileUrls) {
-    addKey(url);
+    addGemCandidateLookupKey(keys, url);
   }
 
   const profiles = Array.isArray(candidate?.profiles) ? candidate.profiles : [];
@@ -695,18 +713,24 @@ function getGemCandidateLinkedInKeys(candidate) {
     const network = normalizeTextToken(profile.network || profile.type || profile.site || "");
     const profileUrl = firstNonEmpty(profile.url, profile.link, profile.href, profile.value);
     if (profileUrl) {
-      if (network === "linkedin" || normalizeLinkedInUrl(profileUrl).includes("linkedin.com/")) {
-        addKey(profileUrl);
-      }
+      addGemCandidateLookupKey(keys, profileUrl);
       continue;
     }
     const username = firstNonEmpty(profile.username, profile.handle);
     if (username && network === "linkedin") {
-      addKey(buildLinkedInUrlFromHandle(username));
+      addGemCandidateLookupKey(keys, buildLinkedInUrlFromHandle(username));
+      continue;
+    }
+    if (username && network === "github") {
+      addGemCandidateLookupKey(keys, buildGitHubUrlFromHandle(username));
     }
   }
 
   return Array.from(keys);
+}
+
+function getGemCandidateLinkedInKeys(candidate) {
+  return getGemCandidateLookupKeys(candidate).filter((key) => key.includes("linkedin.com/"));
 }
 
 function gemLinkedInLookupSize(cache = gemLinkedInUrlLookupCache) {
@@ -732,7 +756,7 @@ function rememberGemCandidateLinkedInKeys(candidate) {
   if (!candidateId) {
     return;
   }
-  const keys = getGemCandidateLinkedInKeys(candidate);
+  const keys = getGemCandidateLookupKeys(candidate);
   if (keys.length === 0) {
     return;
   }
@@ -784,7 +808,7 @@ async function refreshGemLinkedInUrlLookup(audit) {
     if (!candidateId) {
       continue;
     }
-    const keys = getGemCandidateLinkedInKeys(candidate);
+    const keys = getGemCandidateLookupKeys(candidate);
     for (const key of keys) {
       if (!urlToCandidateIds[key]) {
         urlToCandidateIds[key] = candidateId;
@@ -872,6 +896,44 @@ async function findGemCandidateByLinkedInUrl(linkedInUrl, audit) {
   return null;
 }
 
+async function findGemCandidateByProfileUrl(profileUrl, audit) {
+  const normalizedUrl = normalizeProfileUrl(profileUrl);
+  if (!normalizedUrl) {
+    return null;
+  }
+
+  const cachedId = String(gemLinkedInUrlLookupCache?.urlToCandidateIds?.[normalizedUrl] || "").trim();
+  if (cachedId) {
+    try {
+      const candidate = await gemRequest(`/v0/candidates/${cachedId}`, {}, audit);
+      if (candidate?.id) {
+        rememberGemCandidateLinkedInKeys(candidate);
+        return candidate;
+      }
+    } catch (_error) {
+      // Fall through to full index refresh if cached id is stale.
+    }
+  }
+
+  const index = await ensureGemLinkedInUrlLookup(audit);
+  const indexedId = String(index?.urlToCandidateIds?.[normalizedUrl] || "").trim();
+  if (!indexedId) {
+    return null;
+  }
+
+  try {
+    const candidate = await gemRequest(`/v0/candidates/${indexedId}`, {}, audit);
+    if (candidate?.id) {
+      rememberGemCandidateLinkedInKeys(candidate);
+      return candidate;
+    }
+  } catch (_error) {
+    return null;
+  }
+
+  return null;
+}
+
 async function findCandidateByLinkedIn(payload, audit) {
   const handle = sanitizeLinkedInHandle(payload?.linkedInHandle || payload?.linkedinHandle);
   const linkedInUrl = firstNonEmpty(payload?.linkedInUrl, payload?.linkedinUrl, payload?.profileUrl);
@@ -903,6 +965,49 @@ async function findCandidateByLinkedIn(payload, audit) {
   }
 
   return { candidate: null };
+}
+
+async function findCandidateByEmail(payload, audit) {
+  const email = normalizeUserEmail(payload?.email || payload?.emailAddress);
+  if (!email) {
+    throw new Error("email is required.");
+  }
+
+  const list = await gemRequest(
+    "/v0/candidates",
+    {
+      query: {
+        email,
+        page_size: 20
+      }
+    },
+    audit
+  );
+  const candidates = Array.isArray(list) ? list : [];
+  if (candidates.length === 0) {
+    return { candidate: null };
+  }
+
+  const exact = candidates.find((candidate) =>
+    extractCandidateEmailsForUpdate(candidate).some(
+      (entry) => normalizeUserEmail(entry?.emailAddress || "") === email
+    )
+  );
+  const resolved = exact || candidates[0] || null;
+  if (resolved?.id) {
+    rememberGemCandidateLinkedInKeys(resolved);
+  }
+  return { candidate: resolved && resolved.id ? resolved : null };
+}
+
+async function findCandidateByProfileUrl(payload, audit) {
+  const profileUrl = firstNonEmpty(payload?.profileUrl, payload?.url, payload?.githubUrl, payload?.linkedinUrl);
+  const normalized = normalizeProfileUrl(profileUrl);
+  if (!normalized) {
+    throw new Error("profileUrl is required.");
+  }
+  const candidate = await findGemCandidateByProfileUrl(normalized, audit);
+  return { candidate: candidate && candidate.id ? candidate : null };
 }
 
 function normalizeUserEmail(value) {
@@ -1063,6 +1168,103 @@ async function createCandidateFromLinkedIn(payload, audit) {
     last_name: payload.lastName,
     linked_in_handle: linkedInHandle || undefined,
     profile_urls: linkedInUrl ? [linkedInUrl] : undefined,
+    autofill: Boolean(linkedInHandle)
+  });
+
+  try {
+    const candidate = await gemRequest("/v0/candidates", { method: "POST", body }, audit);
+    rememberGemCandidateLinkedInKeys(candidate);
+    return { candidate };
+  } catch (error) {
+    const duplicateId = error?.data?.errors?.duplicate_candidate?.id;
+    if (duplicateId) {
+      logEvent({
+        source: "backend",
+        event: "candidate.duplicate_resolved",
+        message: "Resolved duplicate candidate by existing id.",
+        requestId: audit.requestId,
+        route: audit.route,
+        runId: audit.runId,
+        actionId: audit.actionId,
+        details: { duplicateId }
+      });
+      const candidate = await gemRequest(`/v0/candidates/${duplicateId}`, {}, audit);
+      rememberGemCandidateLinkedInKeys(candidate);
+      return { candidate };
+    }
+    throw error;
+  }
+}
+
+async function createCandidateFromContext(payload, audit) {
+  const linkedInHandle = sanitizeLinkedInHandle(payload?.linkedInHandle || payload?.linkedinHandle);
+  const linkedInUrl = firstNonEmpty(payload?.linkedInUrl, payload?.linkedinUrl);
+  const createdBy = await resolveCreatedByUserId(payload.createdByUserId, payload.createdByUserEmail, audit);
+  if (!createdBy) {
+    throw new Error(
+      "Gem requires created_by. Set createdByUserEmail or createdByUserId in extension options, or set GEM_DEFAULT_USER_ID/GEM_DEFAULT_USER_EMAIL in backend env. Also verify the extension backend URL points to the backend where these env vars are configured."
+    );
+  }
+
+  const emails = [];
+  const seenEmails = new Set();
+  const addEmail = (value) => {
+    const email = normalizeUserEmail(value);
+    if (!email || seenEmails.has(email) || !isValidEmailAddress(email)) {
+      return;
+    }
+    seenEmails.add(email);
+    emails.push(email);
+  };
+  addEmail(payload?.email);
+  addEmail(payload?.emailAddress);
+  if (Array.isArray(payload?.contactEmails)) {
+    payload.contactEmails.forEach((value) => addEmail(value));
+  }
+
+  const profileUrls = [];
+  const seenProfileUrls = new Set();
+  const addProfileUrl = (value) => {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return;
+    }
+    const normalized = normalizeProfileUrl(raw);
+    if (!normalized || seenProfileUrls.has(normalized)) {
+      return;
+    }
+    seenProfileUrls.add(normalized);
+    profileUrls.push(raw);
+  };
+  addProfileUrl(payload?.profileUrl);
+  addProfileUrl(payload?.url);
+  addProfileUrl(payload?.githubUrl);
+  addProfileUrl(payload?.gemProfileUrl);
+  addProfileUrl(linkedInUrl);
+  if (Array.isArray(payload?.profileUrls)) {
+    payload.profileUrls.forEach((value) => addProfileUrl(value));
+  }
+  if (linkedInHandle) {
+    addProfileUrl(buildLinkedInUrlFromHandle(linkedInHandle));
+  }
+
+  if (!linkedInHandle && emails.length === 0 && profileUrls.length === 0) {
+    throw new Error("At least one identifier is required (linkedInHandle, email, or profileUrl).");
+  }
+
+  const body = omitUndefined({
+    created_by: createdBy,
+    first_name: payload.firstName,
+    last_name: payload.lastName,
+    linked_in_handle: linkedInHandle || undefined,
+    profile_urls: profileUrls.length > 0 ? profileUrls : undefined,
+    emails:
+      emails.length > 0
+        ? emails.map((email, index) => ({
+            email_address: email,
+            is_primary: index === 0
+          }))
+        : undefined,
     autofill: Boolean(linkedInHandle)
   });
 
@@ -3390,7 +3592,10 @@ async function uploadGemCandidateToAshby(payload, audit) {
 
 const routes = {
   "/api/candidates/find-by-linkedin": (payload, audit) => findCandidateByLinkedIn(payload, audit),
+  "/api/candidates/find-by-email": (payload, audit) => findCandidateByEmail(payload, audit),
+  "/api/candidates/find-by-profile-url": (payload, audit) => findCandidateByProfileUrl(payload, audit),
   "/api/candidates/create-from-linkedin": createCandidateFromLinkedIn,
+  "/api/candidates/create-from-context": createCandidateFromContext,
   "/api/projects/add-candidate": addCandidateToProject,
   "/api/projects/list": listProjects,
   "/api/ashby/jobs/list": listAshbyJobs,

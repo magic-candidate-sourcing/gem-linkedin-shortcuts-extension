@@ -2456,4 +2456,6 @@ function initGemProfileActions() {
 }
 
 initGemAutomation();
-initGemProfileActions();
+if (!window.__GLS_UNIFIED_CONTENT_ACTIVE__) {
+  initGemProfileActions();
+}

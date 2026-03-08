@@ -111,7 +111,7 @@ document.querySelectorAll("button[data-action]").forEach((button) => {
     } catch (error) {
       const message = error.message || "Failed to send action.";
       if (isRecoverableContentError(message)) {
-        setStatus("Tab needs refresh after extension update. Refresh LinkedIn tab and retry.", true);
+        setStatus("Tab needs refresh after extension update. Refresh the active profile tab and retry.", true);
       } else {
         setStatus(message, true);
       }

@@ -468,22 +468,46 @@ async function setAshbyJobRecentUsage(usage) {
 }
 
 function getCustomFieldCacheKey(context) {
+  const gemCandidateId = String(context?.gemCandidateId || "").trim();
+  if (gemCandidateId) {
+    return `candidate:${gemCandidateId}`;
+  }
+
   const handle = String(context?.linkedInHandle || "").trim().toLowerCase();
   if (handle) {
     return `handle:${handle}`;
   }
 
   const rawUrl = String(context?.linkedinUrl || "").trim().toLowerCase();
-  if (!rawUrl) {
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      parsed.search = "";
+      parsed.hash = "";
+      return `url:${parsed.toString().replace(/\/$/, "")}`;
+    } catch (_error) {
+      return `url:${rawUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`;
+    }
+  }
+
+  const email = collectContextEmails(context)[0] || "";
+  if (email) {
+    return `email:${email}`;
+  }
+
+  const profileUrl = String(collectContextProfileUrls(context)[0] || "")
+    .trim()
+    .toLowerCase();
+  if (!profileUrl) {
     return "";
   }
   try {
-    const parsed = new URL(rawUrl);
+    const parsed = new URL(profileUrl);
     parsed.search = "";
     parsed.hash = "";
-    return `url:${parsed.toString().replace(/\/$/, "")}`;
+    return `profile:${parsed.toString().replace(/\/$/, "")}`;
   } catch (_error) {
-    return `url:${rawUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`;
+    return `profile:${profileUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`;
   }
 }
 
@@ -1065,12 +1089,28 @@ function normalizeProfileUrlForLookup(rawUrl) {
   }
 }
 
+function isLookupCandidateProfileUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = String(parsed.hostname || "").toLowerCase();
+    if (!host) {
+      return false;
+    }
+    if (host === "mail.google.com") {
+      return false;
+    }
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch (_error) {
+    return false;
+  }
+}
+
 function collectContextProfileUrls(context = {}) {
   const urls = [];
   const seen = new Set();
   const add = (value) => {
     const normalized = normalizeProfileUrlForLookup(value);
-    if (!normalized || seen.has(normalized)) {
+    if (!normalized || seen.has(normalized) || !isLookupCandidateProfileUrl(normalized)) {
       return;
     }
     seen.add(normalized);
@@ -2399,18 +2439,7 @@ async function refreshCustomFieldsForContext(settings, context, runId, options =
 async function prefetchCustomFieldsForContext(settings, context, runId) {
   const actionId = ACTIONS.SET_CUSTOM_FIELD;
   const audit = { actionId, runId };
-  const handle = String(context?.linkedInHandle || "").trim();
-  let candidateId = "";
-
-  if (handle) {
-    const found = await callBackend(
-      "/api/candidates/find-by-linkedin",
-      { linkedInHandle: handle },
-      settings,
-      { ...audit, step: "findCandidateForPrefetch" }
-    );
-    candidateId = String(found?.candidate?.id || "");
-  }
+  const candidateId = await findExistingCandidateIdForContext(settings, context, runId, actionId);
 
   const data = await callBackend(
     "/api/custom-fields/list",
@@ -3126,7 +3155,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(async (settings) => {
         const runId = message.runId || generateId();
         const context = message.context || {};
-        if (!context.linkedinUrl && !context.linkedInHandle) {
+        if (!contextHasCandidateIdentity(context)) {
           sendResponse({ ok: true, skipped: true, reason: "missing_context" });
           return;
         }

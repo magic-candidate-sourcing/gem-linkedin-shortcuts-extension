@@ -463,9 +463,11 @@ function collectEmailAddressesFromDom(options = {}) {
 }
 
 function findLinkedInUrlInDocument() {
-  const fromDom = findLinkedInPublicProfileUrlInDom();
-  if (fromDom) {
-    return fromDom;
+  if (isLinkedInProfilePage()) {
+    const fromDom = findLinkedInPublicProfileUrlInDom();
+    if (fromDom) {
+      return fromDom;
+    }
   }
   const anchors = Array.from(document.querySelectorAll("a[href*='linkedin.com/']")).slice(0, 300);
   for (const anchor of anchors) {
@@ -1267,7 +1269,9 @@ function contextHasResolvableIdentity(context) {
   if (String(context.linkedInHandle || "").trim()) {
     return true;
   }
-  if (String(context.profileUrl || "").trim()) {
+  const profileUrl = String(context.profileUrl || "").trim();
+  const sourcePlatform = String(context.sourcePlatform || "").trim().toLowerCase();
+  if (profileUrl && sourcePlatform !== "gmail") {
     return true;
   }
   if (isValidEmailAddressForPicker(String(context.contactEmail || "").trim())) {
