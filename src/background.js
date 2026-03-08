@@ -317,7 +317,6 @@ function broadcastSettingsToLinkedInTabs(settings) {
           "https://www.linkedin.com/*",
           "https://www.gem.com/*",
           "https://app.gem.com/*",
-          "https://mail.google.com/*",
           "https://github.com/*"
         ]
       },
@@ -327,14 +326,14 @@ function broadcastSettingsToLinkedInTabs(settings) {
           return;
         }
         let remaining = tabs.length;
-      for (const tab of tabs) {
-        chrome.tabs.sendMessage(tab.id, { type: "SETTINGS_UPDATED", settings }, () => {
-          remaining -= 1;
-          if (remaining <= 0) {
-            resolve();
-          }
-        });
-      }
+        for (const tab of tabs) {
+          chrome.tabs.sendMessage(tab.id, { type: "SETTINGS_UPDATED", settings }, () => {
+            remaining -= 1;
+            if (remaining <= 0) {
+              resolve();
+            }
+          });
+        }
       }
     );
   });
@@ -1096,9 +1095,6 @@ function isLookupCandidateProfileUrl(url) {
     if (!host) {
       return false;
     }
-    if (host === "mail.google.com") {
-      return false;
-    }
     return parsed.protocol === "https:" || parsed.protocol === "http:";
   } catch (_error) {
     return false;
@@ -1530,13 +1526,16 @@ function buildGemSequenceEditUrl(settings, sequenceId) {
   }
 }
 
-function buildAdjacentTabOptions(url, meta = {}) {
+function buildAdjacentTabOptions(url, meta = {}, overrides = {}) {
   const options = { url };
   if (Number.isInteger(meta.sourceTabIndex)) {
     options.index = meta.sourceTabIndex + 1;
   }
   if (Number.isInteger(meta.sourceWindowId)) {
     options.windowId = meta.sourceWindowId;
+  }
+  if (typeof overrides.active === "boolean") {
+    options.active = overrides.active;
   }
   return options;
 }
@@ -2354,7 +2353,7 @@ async function runAction(actionId, context, settings, meta = {}) {
       return { ok: false, message, runId };
     }
 
-    await chrome.tabs.create(buildAdjacentTabOptions(openUrl, meta));
+    const createdTab = await chrome.tabs.create(buildAdjacentTabOptions(openUrl, meta, { active: false }));
     const message = candidateProfileUrl
       ? "Opened candidate-specific sequence flow in Gem."
       : "Opened sequence in Gem. Complete send + activate in Gem UI.";
@@ -2369,7 +2368,10 @@ async function runAction(actionId, context, settings, meta = {}) {
         candidateId: candidate.id,
         sequenceId,
         sequenceName: context.sequenceName || "",
-        candidateProfileUrl: candidateProfileUrl || ""
+        candidateProfileUrl: candidateProfileUrl || "",
+        tabId: Number.isInteger(createdTab?.id) ? createdTab.id : null,
+        active: false,
+        runId
       }
     });
     return {

@@ -2,11 +2,136 @@
 
 const GEM_AUTOMATION_PARAMS = ["glsAction", "glsRunId", "glsCandidateId", "glsSequenceId", "glsSequenceName"];
 const GEM_ACTION_OPEN_SEQUENCE_FOR_CANDIDATE = "openSequenceForCandidate";
+const SEQUENCE_AUTOMATION_SOFT_TARGET_MS = 10000;
+const SEQUENCE_AUTOMATION_MAX_MS = 45000;
+const SEQUENCE_AUTOMATION_STEP_BUDGETS_MS = Object.freeze({
+  messageTrigger: 20000,
+  openAddToSequence: 20000,
+  findSequenceScope: 15000,
+  selectSequence: 20000,
+  submitAddToSequence: 12000,
+  navigateEditStages: 20000,
+  activatePersonalize: 15000
+});
 
 function delay(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function isTabVisibleForInteraction() {
+  return !document.hidden && document.visibilityState === "visible";
+}
+
+function canUseKeyboardFallback() {
+  if (!isTabVisibleForInteraction()) {
+    return false;
+  }
+  if (typeof document.hasFocus === "function") {
+    return document.hasFocus();
+  }
+  return true;
+}
+
+function createSequenceAutomationError(code, message, details = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.details = details;
+  return error;
+}
+
+function createSequenceFlowState(runId = "") {
+  const startedAt = Date.now();
+  return {
+    runId,
+    startedAt,
+    deadlineAt: startedAt + SEQUENCE_AUTOMATION_MAX_MS
+  };
+}
+
+function getRemainingTimeMs(deadlineAt) {
+  if (!Number.isFinite(deadlineAt)) {
+    return Infinity;
+  }
+  return Math.max(0, deadlineAt - Date.now());
+}
+
+function getFlowRemainingMs(flowState) {
+  if (!flowState) {
+    return Infinity;
+  }
+  return getRemainingTimeMs(flowState.deadlineAt);
+}
+
+function getFlowElapsedMs(flowState) {
+  if (!flowState || !Number.isFinite(flowState.startedAt)) {
+    return 0;
+  }
+  return Math.max(0, Date.now() - flowState.startedAt);
+}
+
+function isFlowExpired(flowState) {
+  return getFlowRemainingMs(flowState) <= 0;
+}
+
+function getStepBudgetMs(stepKey, fallbackMs) {
+  const configured = Number(SEQUENCE_AUTOMATION_STEP_BUDGETS_MS[stepKey]);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+  const fallback = Number(fallbackMs);
+  if (Number.isFinite(fallback) && fallback > 0) {
+    return fallback;
+  }
+  return 1000;
+}
+
+function createStepDeadline(flowState, stepKey, fallbackMs) {
+  const stepBudgetMs = getStepBudgetMs(stepKey, fallbackMs);
+  const flowRemainingMs = getFlowRemainingMs(flowState);
+  const boundedBudgetMs = Number.isFinite(flowRemainingMs) ? Math.min(stepBudgetMs, flowRemainingMs) : stepBudgetMs;
+  const normalizedBudgetMs = Math.max(0, boundedBudgetMs);
+  return {
+    stepKey,
+    deadlineAt: Date.now() + normalizedBudgetMs,
+    budgetMs: normalizedBudgetMs
+  };
+}
+
+function createWaitOptions(deadlineAt, intervalMs = 120) {
+  const visibleIntervalMs = Math.max(60, Number(intervalMs) || 120);
+  const hiddenIntervalMs = Math.max(400, visibleIntervalMs * 4);
+  const options = {
+    visibleIntervalMs,
+    hiddenIntervalMs
+  };
+  if (Number.isFinite(deadlineAt)) {
+    options.deadlineAt = deadlineAt;
+  }
+  return options;
+}
+
+function createFlowDeadlineError(flowState, stage) {
+  return createSequenceAutomationError(
+    "deadline_exceeded",
+    `Gem sequence automation reached the ${SEQUENCE_AUTOMATION_MAX_MS / 1000}s limit at '${stage}'.`,
+    {
+      reason: "deadline_exceeded",
+      stage,
+      elapsedMs: getFlowElapsedMs(flowState),
+      maxMs: SEQUENCE_AUTOMATION_MAX_MS
+    }
+  );
+}
+
+async function delayWithinDeadline(ms, deadlineAt) {
+  const waitMs = Math.min(Math.max(0, Number(ms) || 0), getRemainingTimeMs(deadlineAt));
+  if (waitMs <= 0) {
+    return false;
+  }
+  await delay(waitMs);
+  return true;
 }
 
 function normalizeText(value) {
@@ -194,7 +319,7 @@ function activateElement(element) {
     clickElement(target);
   }
   const focusTarget = unique[0];
-  if (focusTarget && typeof focusTarget.focus === "function") {
+  if (focusTarget && canUseKeyboardFallback() && typeof focusTarget.focus === "function") {
     focusTarget.focus();
     focusTarget.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     focusTarget.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
@@ -375,16 +500,120 @@ function findSequenceOption(sequenceName, sequenceId, scopeRoot) {
   return null;
 }
 
-async function waitForElement(matcher, timeoutMs = 12000, intervalMs = 120) {
+async function waitForElement(matcher, timeoutMs = 12000, intervalMs = 120, options = {}) {
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const element = matcher();
-    if (element) {
-      return element;
-    }
-    await delay(intervalMs);
+  const normalizedTimeoutMs = Math.max(0, Number(timeoutMs) || 0);
+  const timeoutDeadlineAt = startedAt + normalizedTimeoutMs;
+  const requestedDeadlineAt = Number(options.deadlineAt);
+  const deadlineAt = Number.isFinite(requestedDeadlineAt) ? Math.min(requestedDeadlineAt, timeoutDeadlineAt) : timeoutDeadlineAt;
+  if (deadlineAt <= Date.now()) {
+    return null;
   }
-  return null;
+
+  const visibleIntervalMs = Math.max(50, Number(options.visibleIntervalMs) || Number(intervalMs) || 120);
+  const hiddenIntervalMs = Math.max(300, Number(options.hiddenIntervalMs) || Math.max(visibleIntervalMs * 4, 400));
+  const observerRoot =
+    options.root && typeof options.root.nodeType === "number" ? options.root : document.documentElement || document;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timerId = null;
+    let observer = null;
+    let queued = false;
+
+    const cleanup = () => {
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      if (observer) {
+        observer.disconnect();
+        observer = null;
+      }
+      document.removeEventListener("visibilitychange", onVisibilityChange, true);
+    };
+
+    const finish = (value) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(value || null);
+    };
+
+    const scheduleNext = () => {
+      if (settled) {
+        return;
+      }
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        finish(null);
+        return;
+      }
+      const isHidden = document.hidden || document.visibilityState !== "visible";
+      const delayMs = Math.min(remainingMs, isHidden ? hiddenIntervalMs : visibleIntervalMs);
+      timerId = setTimeout(() => {
+        timerId = null;
+        runCheck();
+      }, Math.max(20, delayMs));
+    };
+
+    const runCheck = () => {
+      if (settled) {
+        return;
+      }
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      let match = null;
+      try {
+        match = matcher();
+      } catch (_error) {
+        match = null;
+      }
+      if (match) {
+        finish(match);
+        return;
+      }
+      scheduleNext();
+    };
+
+    const queueCheck = () => {
+      if (settled || queued) {
+        return;
+      }
+      queued = true;
+      Promise.resolve().then(() => {
+        queued = false;
+        runCheck();
+      });
+    };
+
+    const onVisibilityChange = () => {
+      queueCheck();
+    };
+
+    document.addEventListener("visibilitychange", onVisibilityChange, true);
+    if (typeof MutationObserver === "function" && observerRoot) {
+      observer = new MutationObserver(() => {
+        queueCheck();
+      });
+      try {
+        observer.observe(observerRoot, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          characterData: true
+        });
+      } catch (_error) {
+        observer = null;
+      }
+    }
+
+    runCheck();
+  });
 }
 
 function findAddToSequenceOption(root = document) {
@@ -457,19 +686,27 @@ function getMessageMenuTriggers() {
   return (menuCapable.length > 0 ? menuCapable : deduped).slice(0, 8);
 }
 
-async function openMessageMenuAndFindAddToSequence() {
+async function openMessageMenuAndFindAddToSequence(stepDeadlineAt = null) {
   const triggers = getMessageMenuTriggers();
   for (const trigger of triggers) {
+    if (getRemainingTimeMs(stepDeadlineAt) <= 0) {
+      return null;
+    }
     clickElement(trigger);
-    if (typeof trigger.focus === "function") {
+    if (canUseKeyboardFallback() && typeof trigger.focus === "function") {
       trigger.focus();
     }
-    await delay(120);
+    await delayWithinDeadline(120, stepDeadlineAt);
     const directMenuRootId = String(trigger.getAttribute("aria-controls") || "").trim();
     if (directMenuRootId) {
       const directMenuRoot = document.getElementById(directMenuRootId);
       if (directMenuRoot && isVisible(directMenuRoot)) {
-        const directOption = await waitForElement(() => findAddToSequenceOption(directMenuRoot), 1800, 90);
+        const directOption = await waitForElement(
+          () => findAddToSequenceOption(directMenuRoot),
+          Math.min(1800, getRemainingTimeMs(stepDeadlineAt)),
+          90,
+          createWaitOptions(stepDeadlineAt, 90)
+        );
         if (directOption) {
           return directOption;
         }
@@ -485,26 +722,31 @@ async function openMessageMenuAndFindAddToSequence() {
         }
       }
       return null;
-    }, 1800, 90);
+    }, Math.min(1800, getRemainingTimeMs(stepDeadlineAt)), 90, createWaitOptions(stepDeadlineAt, 90));
     if (fromVisibleMenus) {
       return fromVisibleMenus;
     }
 
-    const directFromDocument = await waitForElement(() => findAddToSequenceOption(document), 1200, 90);
+    const directFromDocument = await waitForElement(
+      () => findAddToSequenceOption(document),
+      Math.min(1200, getRemainingTimeMs(stepDeadlineAt)),
+      90,
+      createWaitOptions(stepDeadlineAt, 90)
+    );
     if (directFromDocument) {
       return directFromDocument;
     }
 
     // Overlay can be portal/shadow-like; navigate menu via keyboard as fallback.
-    if (typeof trigger.focus === "function") {
+    if (canUseKeyboardFallback() && typeof trigger.focus === "function") {
       trigger.focus();
+      triggerKey(trigger, "ArrowDown");
+      await delayWithinDeadline(80, stepDeadlineAt);
+      triggerKey(trigger, "ArrowDown");
+      await delayWithinDeadline(80, stepDeadlineAt);
+      triggerKey(trigger, "Enter");
+      await delayWithinDeadline(220, stepDeadlineAt);
     }
-    triggerKey(trigger, "ArrowDown");
-    await delay(80);
-    triggerKey(trigger, "ArrowDown");
-    await delay(80);
-    triggerKey(trigger, "Enter");
-    await delay(220);
 
     const postKeyboard = await waitForElement(() => {
       return (
@@ -512,7 +754,7 @@ async function openMessageMenuAndFindAddToSequence() {
         findNextEditStagesButton(document) ||
         (window.location.href.includes("/edit/recipients") ? { alreadyOpened: true } : null)
       );
-    }, 1400, 100);
+    }, Math.min(1400, getRemainingTimeMs(stepDeadlineAt)), 100, createWaitOptions(stepDeadlineAt, 100));
     if (postKeyboard) {
       return postKeyboard.alreadyOpened ? postKeyboard : postKeyboard;
     }
@@ -586,7 +828,7 @@ function findNextEditStagesButton(root = document) {
   return findNextEditStagesButtonStrict(root);
 }
 
-async function waitForEditStagesReached(timeoutMs = 20000, intervalMs = 120) {
+async function waitForEditStagesReached(timeoutMs = 20000, intervalMs = 120, waitOptions = {}) {
   return waitForElement(() => {
     if (isEditStagesUrl(window.location.href)) {
       return { matchedBy: "url" };
@@ -595,21 +837,32 @@ async function waitForEditStagesReached(timeoutMs = 20000, intervalMs = 120) {
       return { matchedBy: "dom_marker" };
     }
     return null;
-  }, timeoutMs, intervalMs);
+  }, timeoutMs, intervalMs, waitOptions);
 }
 
-async function navigateToEditStages(runId = "", maxRetries = 3) {
-  const immediate = await waitForEditStagesReached(1200, 120);
+async function navigateToEditStages(runId = "", maxRetries = 3, flowState = null) {
+  const stepWindow = createStepDeadline(flowState, "navigateEditStages", 20000);
+  const stepOptions = createWaitOptions(stepWindow.deadlineAt, 120);
+  const immediate = await waitForEditStagesReached(Math.min(1200, getRemainingTimeMs(stepWindow.deadlineAt)), 120, stepOptions);
   if (immediate) {
     return {
       ok: true,
       matchedBy: immediate.matchedBy,
-      retries: 0
+      retries: 0,
+      reason: ""
     };
   }
 
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-    const nextButton = await waitForElement(() => findNextEditStagesButtonStrict(document), 7000, 120);
+    if (getRemainingTimeMs(stepWindow.deadlineAt) <= 0) {
+      break;
+    }
+    const nextButton = await waitForElement(
+      () => findNextEditStagesButtonStrict(document),
+      Math.min(7000, getRemainingTimeMs(stepWindow.deadlineAt)),
+      120,
+      stepOptions
+    );
     if (!nextButton) {
       await sendLog({
         level: "warn",
@@ -622,7 +875,7 @@ async function navigateToEditStages(runId = "", maxRetries = 3) {
           snapshot: collectDebugSnapshot()
         }
       });
-      await delay(500);
+      await delayWithinDeadline(500, stepWindow.deadlineAt);
       continue;
     }
 
@@ -650,7 +903,7 @@ async function navigateToEditStages(runId = "", maxRetries = 3) {
           snapshot: collectDebugSnapshot()
         }
       });
-      await delay(500);
+      await delayWithinDeadline(500, stepWindow.deadlineAt);
       continue;
     }
 
@@ -658,7 +911,7 @@ async function navigateToEditStages(runId = "", maxRetries = 3) {
       nextButton.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
     }
     clickElement(nextButton);
-    if (typeof nextButton.focus === "function") {
+    if (canUseKeyboardFallback() && typeof nextButton.focus === "function") {
       nextButton.focus();
       triggerKey(nextButton, "Enter");
     }
@@ -673,12 +926,13 @@ async function navigateToEditStages(runId = "", maxRetries = 3) {
       }
     });
 
-    const reached = await waitForEditStagesReached(7000, 120);
+    const reached = await waitForEditStagesReached(Math.min(7000, getRemainingTimeMs(stepWindow.deadlineAt)), 120, stepOptions);
     if (reached) {
       return {
         ok: true,
         matchedBy: reached.matchedBy,
-        retries: attempt - 1
+        retries: attempt - 1,
+        reason: ""
       };
     }
 
@@ -694,16 +948,21 @@ async function navigateToEditStages(runId = "", maxRetries = 3) {
         snapshot: collectDebugSnapshot()
       }
     });
-    await delay(500);
+    await delayWithinDeadline(500, stepWindow.deadlineAt);
   }
+
+  const timedOut = getRemainingTimeMs(stepWindow.deadlineAt) <= 0;
 
   await sendLog({
     level: "error",
     event: "gem.sequence_automation.next_edit_stages.failed",
     runId,
-    message: "Failed to navigate to Edit stages after retries.",
+    message: timedOut
+      ? "Failed to navigate to Edit stages before deadline."
+      : "Failed to navigate to Edit stages after retries.",
     details: {
       retries: maxRetries,
+      reason: timedOut ? "deadline_exceeded" : "max_retries",
       url: window.location.href,
       snapshot: collectDebugSnapshot()
     }
@@ -712,7 +971,8 @@ async function navigateToEditStages(runId = "", maxRetries = 3) {
   return {
     ok: false,
     matchedBy: "",
-    retries: maxRetries
+    retries: maxRetries,
+    reason: timedOut ? "deadline_exceeded" : "max_retries"
   };
 }
 
@@ -780,7 +1040,9 @@ function isPersonalizeModeActive(root = document) {
   return false;
 }
 
-async function activatePersonalizeMode(runId = "", maxRetries = 3) {
+async function activatePersonalizeMode(runId = "", maxRetries = 3, flowState = null) {
+  const stepWindow = createStepDeadline(flowState, "activatePersonalize", 12000);
+  const stepOptions = createWaitOptions(stepWindow.deadlineAt, 120);
   if (isPersonalizeModeActive(document)) {
     await sendLog({
       event: "gem.sequence_automation.personalize.found",
@@ -792,11 +1054,19 @@ async function activatePersonalizeMode(runId = "", maxRetries = 3) {
         url: window.location.href
       }
     });
-    return { ok: true, retries: 0, alreadyActive: true };
+    return { ok: true, retries: 0, alreadyActive: true, reason: "" };
   }
 
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
-    const personalizeButton = await waitForElement(() => findPersonalizeButtonStrict(document), 7000, 120);
+    if (getRemainingTimeMs(stepWindow.deadlineAt) <= 0) {
+      break;
+    }
+    const personalizeButton = await waitForElement(
+      () => findPersonalizeButtonStrict(document),
+      Math.min(7000, getRemainingTimeMs(stepWindow.deadlineAt)),
+      120,
+      stepOptions
+    );
     if (!personalizeButton) {
       await sendLog({
         level: "warn",
@@ -810,7 +1080,7 @@ async function activatePersonalizeMode(runId = "", maxRetries = 3) {
           url: window.location.href
         }
       });
-      await delay(500);
+      await delayWithinDeadline(500, stepWindow.deadlineAt);
       continue;
     }
 
@@ -829,7 +1099,7 @@ async function activatePersonalizeMode(runId = "", maxRetries = 3) {
       personalizeButton.scrollIntoView({ block: "center", inline: "nearest", behavior: "auto" });
     }
     clickElement(personalizeButton);
-    if (typeof personalizeButton.focus === "function") {
+    if (canUseKeyboardFallback() && typeof personalizeButton.focus === "function") {
       personalizeButton.focus();
       triggerKey(personalizeButton, "Enter");
     }
@@ -844,9 +1114,14 @@ async function activatePersonalizeMode(runId = "", maxRetries = 3) {
       }
     });
 
-    const activated = await waitForElement(() => (isPersonalizeModeActive(document) ? { active: true } : null), 5000, 120);
+    const activated = await waitForElement(
+      () => (isPersonalizeModeActive(document) ? { active: true } : null),
+      Math.min(5000, getRemainingTimeMs(stepWindow.deadlineAt)),
+      120,
+      stepOptions
+    );
     if (activated) {
-      return { ok: true, retries: attempt - 1, alreadyActive: false };
+      return { ok: true, retries: attempt - 1, alreadyActive: false, reason: "" };
     }
 
     await sendLog({
@@ -861,24 +1136,35 @@ async function activatePersonalizeMode(runId = "", maxRetries = 3) {
         url: window.location.href
       }
     });
-    await delay(500);
+    await delayWithinDeadline(500, stepWindow.deadlineAt);
   }
+
+  const timedOut = getRemainingTimeMs(stepWindow.deadlineAt) <= 0;
 
   await sendLog({
     level: "error",
     event: "gem.sequence_automation.personalize.failed",
     runId,
-    message: "Failed to activate 'Personalize' after retries.",
+    message: timedOut
+      ? "Failed to activate 'Personalize' before deadline."
+      : "Failed to activate 'Personalize' after retries.",
     details: {
       retries: maxRetries,
+      reason: timedOut ? "deadline_exceeded" : "max_retries",
       snapshot: collectDebugSnapshot(),
       url: window.location.href
     }
   });
-  return { ok: false, retries: maxRetries, alreadyActive: false };
+  return {
+    ok: false,
+    retries: maxRetries,
+    alreadyActive: false,
+    reason: timedOut ? "deadline_exceeded" : "max_retries"
+  };
 }
 
-async function findSequenceSelectionScope() {
+async function findSequenceSelectionScope(flowState = null) {
+  const stepWindow = createStepDeadline(flowState, "findSequenceScope", 8000);
   const scope = await waitForElement(() => {
     const chooseModal = findChooseSequenceModal();
     if (chooseModal) {
@@ -901,13 +1187,17 @@ async function findSequenceSelectionScope() {
       }
     }
     return null;
-  }, 8000, 120);
+  }, Math.min(stepWindow.budgetMs || 8000, getRemainingTimeMs(stepWindow.deadlineAt)), 120, createWaitOptions(stepWindow.deadlineAt, 120));
   return scope || null;
 }
 
-async function openAddToSequenceFlowFromMessage(runId = "") {
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    const addToSequence = await openMessageMenuAndFindAddToSequence();
+async function openAddToSequenceFlowFromMessage(runId = "", flowState = null) {
+  const stepWindow = createStepDeadline(flowState, "openAddToSequence", 12000);
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    if (getRemainingTimeMs(stepWindow.deadlineAt) <= 0) {
+      return { ok: false, reason: "deadline_exceeded" };
+    }
+    const addToSequence = await openMessageMenuAndFindAddToSequence(stepWindow.deadlineAt);
     if (!addToSequence) {
       await sendLog({
         level: "warn",
@@ -916,7 +1206,7 @@ async function openAddToSequenceFlowFromMessage(runId = "") {
         message: `Add to sequence not found on attempt ${attempt}.`,
         details: collectDebugSnapshot()
       });
-      await delay(180);
+      await delayWithinDeadline(180, stepWindow.deadlineAt);
       continue;
     }
     if (!addToSequence.alreadyOpened) {
@@ -929,15 +1219,19 @@ async function openAddToSequenceFlowFromMessage(runId = "") {
         Boolean(window.location.href.includes("/edit/recipients")) ||
         Boolean(window.location.href.includes("/edit/stages")) ||
         Boolean(document.querySelector("[role='dialog'], .ReactModal__Content, .artdeco-modal")),
-      2500,
-      120
+      Math.min(2500, getRemainingTimeMs(stepWindow.deadlineAt)),
+      120,
+      createWaitOptions(stepWindow.deadlineAt, 120)
     );
     if (opened) {
-      return true;
+      return { ok: true, reason: "" };
     }
-    await delay(220);
+    await delayWithinDeadline(220, stepWindow.deadlineAt);
   }
-  return false;
+  if (getRemainingTimeMs(stepWindow.deadlineAt) <= 0) {
+    return { ok: false, reason: "deadline_exceeded" };
+  }
+  return { ok: false, reason: "not_found" };
 }
 
 function readAutomationParams() {
@@ -983,7 +1277,9 @@ function sendLog(payload) {
   });
 }
 
-async function selectSequence(params, scopeRoot) {
+async function selectSequence(params, scopeRoot, flowState = null) {
+  const stepWindow = createStepDeadline(flowState, "selectSequence", 15000);
+  const stepOptions = createWaitOptions(stepWindow.deadlineAt, 120);
   const sequenceName = String(params.sequenceName || "").trim();
   const sequenceId = String(params.sequenceId || "").trim();
   const chooseModal = findChooseSequenceModal();
@@ -1000,7 +1296,7 @@ async function selectSequence(params, scopeRoot) {
         const enabled = await waitForElement(() => {
           const button = findAddToSequenceSubmitButton(sequenceModal);
           return button && !isDisabledButton(button) ? button : null;
-        }, 3000, 120);
+        }, Math.min(3000, getRemainingTimeMs(stepWindow.deadlineAt)), 120, stepOptions);
         if (enabled) {
           return true;
         }
@@ -1022,10 +1318,12 @@ async function selectSequence(params, scopeRoot) {
     const pickerTrigger = findModalSequencePickerTrigger(sequenceModal);
     if (pickerTrigger) {
       clickElement(pickerTrigger);
-      await delay(120);
+      await delayWithinDeadline(120, stepWindow.deadlineAt);
       const input = findSequenceSearchInput(sequenceModal);
       if (input && sequenceName) {
-        input.focus();
+        if (isTabVisibleForInteraction() && typeof input.focus === "function") {
+          input.focus();
+        }
         setNativeInputValue(input, sequenceName);
       }
 
@@ -1037,14 +1335,14 @@ async function selectSequence(params, scopeRoot) {
         const containsName = options.find((option) => Boolean(normalizedName) && normalizeText(option.label).includes(normalizedName));
         const containsId = options.find((option) => Boolean(normalizedId) && normalizeText(option.label).includes(normalizedId));
         return (exactName || containsName || containsId || null)?.node || null;
-      }, 3500, 120);
+      }, Math.min(3500, getRemainingTimeMs(stepWindow.deadlineAt)), 120, stepOptions);
 
       if (pickedFromList) {
         clickElement(pickedFromList);
         const submitButton = await waitForElement(() => {
           const button = findAddToSequenceSubmitButton(sequenceModal);
           return button && !isDisabledButton(button) ? button : null;
-        }, 3000, 120);
+        }, Math.min(3000, getRemainingTimeMs(stepWindow.deadlineAt)), 120, stepOptions);
         if (submitButton) {
           return true;
         }
@@ -1069,7 +1367,7 @@ async function selectSequence(params, scopeRoot) {
   const startedAt = Date.now();
   let searchTypedAt = 0;
 
-  while (Date.now() - startedAt < 15000) {
+  while (Date.now() - startedAt < 15000 && getRemainingTimeMs(stepWindow.deadlineAt) > 0) {
     const option = findSequenceOption(sequenceName, sequenceId, scopeRoot);
     if (option) {
       clickElement(option);
@@ -1078,13 +1376,17 @@ async function selectSequence(params, scopeRoot) {
 
     const input = findSequenceSearchInput(scopeRoot);
     if (input && sequenceName && Date.now() - searchTypedAt > 600) {
-      input.focus();
+      if (isTabVisibleForInteraction() && typeof input.focus === "function") {
+        input.focus();
+      }
       setNativeInputValue(input, sequenceName);
-      input.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      if (canUseKeyboardFallback()) {
+        input.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      }
       searchTypedAt = Date.now();
     }
 
-    await delay(120);
+    await delayWithinDeadline(120, stepWindow.deadlineAt);
   }
   await sendLog({
     level: "warn",
@@ -1104,7 +1406,8 @@ async function selectSequence(params, scopeRoot) {
   return false;
 }
 
-async function submitAddToSequence(scopeRoot) {
+async function submitAddToSequence(scopeRoot, flowState = null) {
+  const stepWindow = createStepDeadline(flowState, "submitAddToSequence", 10000);
   const chooseModal = findChooseSequenceModal();
   const targetRoot = chooseModal && scopeRoot && (chooseModal === scopeRoot || chooseModal.contains(scopeRoot)) ? chooseModal : scopeRoot;
   if (!targetRoot) {
@@ -1113,7 +1416,7 @@ async function submitAddToSequence(scopeRoot) {
   const addButton = await waitForElement(() => {
     const button = findAddToSequenceSubmitButton(targetRoot);
     return button && !isDisabledButton(button) ? button : null;
-  }, 10000, 120);
+  }, Math.min(10000, getRemainingTimeMs(stepWindow.deadlineAt)), 120, createWaitOptions(stepWindow.deadlineAt, 120));
   if (!addButton) {
     return false;
   }
@@ -1122,6 +1425,7 @@ async function submitAddToSequence(scopeRoot) {
 }
 
 async function runOpenSequenceForCandidateFlow(params) {
+  const flowState = createSequenceFlowState(params.runId || "");
   await sendLog({
     event: "gem.sequence_automation.started",
     runId: params.runId,
@@ -1130,17 +1434,32 @@ async function runOpenSequenceForCandidateFlow(params) {
     details: {
       candidateId: params.candidateId,
       sequenceId: params.sequenceId,
-      sequenceName: params.sequenceName
+      sequenceName: params.sequenceName,
+      softTargetMs: SEQUENCE_AUTOMATION_SOFT_TARGET_MS,
+      maxDurationMs: SEQUENCE_AUTOMATION_MAX_MS
     }
   });
 
-  const messageTrigger = await waitForElement(() => getMessageMenuTriggers()[0] || null, 20000, 120);
+  const messageStep = createStepDeadline(flowState, "messageTrigger", 20000);
+  const messageTrigger = await waitForElement(
+    () => getMessageMenuTriggers()[0] || null,
+    Math.min(20000, getRemainingTimeMs(messageStep.deadlineAt)),
+    120,
+    createWaitOptions(messageStep.deadlineAt, 120)
+  );
   if (!messageTrigger) {
-    throw new Error("Could not find the Message menu in Gem.");
+    if (isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "message_trigger");
+    }
+    throw createSequenceAutomationError("message_menu_not_found", "Could not find the Message menu in Gem.", {
+      reason: "message_menu_not_found",
+      stage: "message_trigger",
+      elapsedMs: getFlowElapsedMs(flowState)
+    });
   }
 
-  const addToSequenceOpened = await openAddToSequenceFlowFromMessage(params.runId || "");
-  if (!addToSequenceOpened) {
+  const addToSequenceOpened = await openAddToSequenceFlowFromMessage(params.runId || "", flowState);
+  if (!addToSequenceOpened.ok) {
     await sendLog({
       level: "error",
       event: "gem.sequence_automation.debug.final_snapshot",
@@ -1148,34 +1467,87 @@ async function runOpenSequenceForCandidateFlow(params) {
       message: "Final DOM snapshot before failing add-to-sequence.",
       details: collectDebugSnapshot()
     });
-    throw new Error("Could not find 'Add to sequence' in Gem Message menu.");
+    if (addToSequenceOpened.reason === "deadline_exceeded" || isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "open_add_to_sequence");
+    }
+    throw createSequenceAutomationError("add_to_sequence_not_found", "Could not find 'Add to sequence' in Gem Message menu.", {
+      reason: addToSequenceOpened.reason || "not_found",
+      stage: "open_add_to_sequence",
+      elapsedMs: getFlowElapsedMs(flowState)
+    });
   }
 
-  const sequenceScope = await findSequenceSelectionScope();
+  const sequenceScope = await findSequenceSelectionScope(flowState);
   if (!sequenceScope) {
-    throw new Error("Could not find the sequence selection popup.");
+    if (isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "find_sequence_scope");
+    }
+    throw createSequenceAutomationError("sequence_scope_not_found", "Could not find the sequence selection popup.", {
+      reason: "sequence_scope_not_found",
+      stage: "find_sequence_scope",
+      elapsedMs: getFlowElapsedMs(flowState)
+    });
   }
 
-  const selected = await selectSequence(params, sequenceScope);
+  const selected = await selectSequence(params, sequenceScope, flowState);
   if (!selected) {
-    throw new Error(`Could not select sequence '${params.sequenceName || params.sequenceId}'.`);
+    if (isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "select_sequence");
+    }
+    throw createSequenceAutomationError("sequence_selection_failed", `Could not select sequence '${params.sequenceName || params.sequenceId}'.`, {
+      reason: "sequence_selection_failed",
+      stage: "select_sequence",
+      elapsedMs: getFlowElapsedMs(flowState)
+    });
   }
 
-  const submitted = await submitAddToSequence(sequenceScope);
+  const submitted = await submitAddToSequence(sequenceScope, flowState);
   if (!submitted) {
-    throw new Error("Could not submit 'Add to sequence' after selecting sequence.");
+    if (isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "submit_add_to_sequence");
+    }
+    throw createSequenceAutomationError("submit_add_to_sequence_failed", "Could not submit 'Add to sequence' after selecting sequence.", {
+      reason: "submit_add_to_sequence_failed",
+      stage: "submit_add_to_sequence",
+      elapsedMs: getFlowElapsedMs(flowState)
+    });
   }
 
-  const editStagesResult = await navigateToEditStages(params.runId || "", 3);
+  const editStagesResult = await navigateToEditStages(params.runId || "", 5, flowState);
   if (!editStagesResult.ok) {
-    throw new Error(`Gem did not navigate to Edit stages after clicking 'Next: Edit stages'. URL: ${window.location.href}`);
+    if (editStagesResult.reason === "deadline_exceeded" || isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "navigate_edit_stages");
+    }
+    throw createSequenceAutomationError(
+      "edit_stages_not_reached",
+      `Gem did not navigate to Edit stages after clicking 'Next: Edit stages'. URL: ${window.location.href}`,
+      {
+        reason: editStagesResult.reason || "navigation_not_reached",
+        stage: "navigate_edit_stages",
+        elapsedMs: getFlowElapsedMs(flowState),
+        url: window.location.href
+      }
+    );
   }
 
-  const personalizeResult = await activatePersonalizeMode(params.runId || "", 3);
+  const personalizeResult = await activatePersonalizeMode(params.runId || "", 5, flowState);
   if (!personalizeResult.ok) {
-    throw new Error(`Gem reached Edit stages but failed to activate 'Personalize'. URL: ${window.location.href}`);
+    if (personalizeResult.reason === "deadline_exceeded" || isFlowExpired(flowState)) {
+      throw createFlowDeadlineError(flowState, "activate_personalize");
+    }
+    throw createSequenceAutomationError(
+      "personalize_activation_failed",
+      `Gem reached Edit stages but failed to activate 'Personalize'. URL: ${window.location.href}`,
+      {
+        reason: personalizeResult.reason || "not_active_after_click",
+        stage: "activate_personalize",
+        elapsedMs: getFlowElapsedMs(flowState),
+        url: window.location.href
+      }
+    );
   }
 
+  const totalElapsedMs = getFlowElapsedMs(flowState);
   await sendLog({
     event: "gem.sequence_automation.succeeded",
     runId: params.runId,
@@ -1189,7 +1561,9 @@ async function runOpenSequenceForCandidateFlow(params) {
       editStagesMatchedBy: editStagesResult.matchedBy || "",
       editStagesRetries: editStagesResult.retries,
       personalizeRetries: personalizeResult.retries,
-      personalizeAlreadyActive: Boolean(personalizeResult.alreadyActive)
+      personalizeAlreadyActive: Boolean(personalizeResult.alreadyActive),
+      elapsedMs: totalElapsedMs,
+      withinSoftTarget: totalElapsedMs <= SEQUENCE_AUTOMATION_SOFT_TARGET_MS
     }
   });
 }
@@ -1229,7 +1603,10 @@ async function initGemAutomation() {
       details: {
         candidateId: params.candidateId,
         sequenceId: params.sequenceId,
-        sequenceName: params.sequenceName
+        sequenceName: params.sequenceName,
+        reason: error?.code || "unknown",
+        stage: error?.details?.stage || "",
+        elapsedMs: Number.isFinite(error?.details?.elapsedMs) ? error.details.elapsedMs : 0
       }
     });
   }

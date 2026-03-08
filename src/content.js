@@ -101,10 +101,6 @@ function isGemHost(hostname) {
   return /(^|\.)gem\.com$/i.test(String(hostname || ""));
 }
 
-function isGmailHost(hostname) {
-  return /(^|\.)mail\.google\.com$/i.test(String(hostname || ""));
-}
-
 function isGitHubHost(hostname) {
   return /(^|\.)github\.com$/i.test(String(hostname || ""));
 }
@@ -198,17 +194,8 @@ function isGitHubProfilePage() {
   }
 }
 
-function isGmailPage() {
-  try {
-    const parsed = new URL(window.location.href);
-    return isGmailHost(parsed.hostname);
-  } catch (_error) {
-    return /^https:\/\/mail\.google\.com\//i.test(window.location.href);
-  }
-}
-
 function isSupportedActionPage() {
-  return isLinkedInProfilePage() || isGemCandidateProfilePage() || isGmailPage() || isGitHubProfilePage();
+  return isLinkedInProfilePage() || isGemCandidateProfilePage() || isGitHubProfilePage();
 }
 
 function normalizeUrlForContext(url, options = {}) {
@@ -243,9 +230,7 @@ function normalizePageUrlForWatcher(url = window.location.href) {
   try {
     const parsed = new URL(url, window.location.origin);
     parsed.search = "";
-    if (!isGmailHost(parsed.hostname)) {
-      parsed.hash = "";
-    }
+    parsed.hash = "";
     return parsed.toString();
   } catch (_error) {
     return String(url || "");
@@ -546,57 +531,6 @@ function getGemProfileContext() {
   };
 }
 
-function getGmailCurrentUserEmails() {
-  const emails = new Set();
-  readEmailsFromString(cachedSettings?.createdByUserEmail || "", emails);
-  const accountNodes = Array.from(
-    document.querySelectorAll("a[aria-label*='Google Account'], div[aria-label*='Google Account'], button[aria-label*='Google Account']")
-  ).slice(0, 20);
-  accountNodes.forEach((node) => {
-    readEmailsFromString(node.getAttribute("aria-label") || "", emails);
-  });
-  return emails;
-}
-
-function getGmailConversationEmails() {
-  const selectors = [
-    ".gD[email]",
-    ".go[email]",
-    ".g2[email]",
-    "span[email]",
-    "div[email]",
-    "a[href^='mailto:']",
-    "[data-hovercard-id]"
-  ];
-  return collectEmailAddressesFromDom({ selectors, maxNodes: 600 });
-}
-
-function getGmailThreadTitle() {
-  const titleNode = document.querySelector("h2.hP, h2[data-thread-perm-id], h2[role='heading']");
-  return String(titleNode?.textContent || "").trim();
-}
-
-function getGmailContext() {
-  const pageUrl = normalizePageUrlForWatcher(window.location.href);
-  const profileUrl = normalizeUrlForContext(window.location.href, { keepHash: true });
-  const allEmails = getGmailConversationEmails();
-  const selfEmails = getGmailCurrentUserEmails();
-  const nonSelfEmail = allEmails.find((email) => !selfEmails.has(String(email || "").toLowerCase())) || "";
-  const primaryEmail = nonSelfEmail || allEmails[0] || "";
-  const profileName = getGmailThreadTitle();
-  return {
-    sourcePlatform: "gmail",
-    pageUrl,
-    profileUrl,
-    gemProfileUrl: "",
-    linkedinUrl: "",
-    linkedInHandle: "",
-    contactEmails: allEmails,
-    contactEmail: primaryEmail,
-    profileName
-  };
-}
-
 function getGitHubProfileName() {
   const selectors = [
     "h1.vcard-names span.p-name",
@@ -655,9 +589,6 @@ function getProfileContext() {
   }
   if (isGemCandidateProfilePage()) {
     return getGemProfileContext();
-  }
-  if (isGmailPage()) {
-    return getGmailContext();
   }
   if (isGitHubProfilePage()) {
     return getGitHubContext();
@@ -1269,9 +1200,7 @@ function contextHasResolvableIdentity(context) {
   if (String(context.linkedInHandle || "").trim()) {
     return true;
   }
-  const profileUrl = String(context.profileUrl || "").trim();
-  const sourcePlatform = String(context.sourcePlatform || "").trim().toLowerCase();
-  if (profileUrl && sourcePlatform !== "gmail") {
+  if (String(context.profileUrl || "").trim()) {
     return true;
   }
   if (isValidEmailAddressForPicker(String(context.contactEmail || "").trim())) {
@@ -6595,7 +6524,7 @@ async function handleAction(actionId, source = "keyboard", runId = "") {
       return;
     }
     if (!isSupportedActionPage()) {
-      showToast("Open LinkedIn, Gem candidate, Gmail, or GitHub profile to run this action.", true);
+      showToast("Open LinkedIn, Gem candidate, or GitHub profile to run this action.", true);
       logEvent({
         source: "extension.content",
         level: "warn",
