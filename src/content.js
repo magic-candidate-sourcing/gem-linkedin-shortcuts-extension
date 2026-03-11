@@ -1660,7 +1660,7 @@ function prefetchProjects(runId, options = {}) {
   });
 }
 
-function listSequences(query, runId, actionId = ACTIONS.SEND_SEQUENCE) {
+function listSequences(query, runId, actionId = ACTIONS.SEND_SEQUENCE, options = {}) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(
       {
@@ -1668,7 +1668,10 @@ function listSequences(query, runId, actionId = ACTIONS.SEND_SEQUENCE) {
         query: String(query || ""),
         limit: 0,
         runId: runId || "",
-        actionId
+        actionId,
+        forceRefresh: Boolean(options.forceRefresh),
+        preferCache: Boolean(options.preferCache),
+        forceNewRefresh: Boolean(options.forceNewRefresh)
       },
       (response) => {
         if (chrome.runtime.lastError) {
@@ -1682,6 +1685,11 @@ function listSequences(query, runId, actionId = ACTIONS.SEND_SEQUENCE) {
           return;
         }
         if (!response?.ok) {
+          if (isContextInvalidatedResponse(response)) {
+            triggerContextRecovery(response?.message || "Extension context invalidated.");
+            reject(new Error("Extension updated. Reloading page."));
+            return;
+          }
           reject(new Error(response?.message || "Could not load sequences"));
           return;
         }
@@ -1691,13 +1699,15 @@ function listSequences(query, runId, actionId = ACTIONS.SEND_SEQUENCE) {
   });
 }
 
-function prefetchSequences(runId) {
+function prefetchSequences(runId, options = {}) {
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
       {
         type: "PREFETCH_SEQUENCES",
         runId: runId || "",
-        limit: 0
+        limit: 0,
+        forceRefresh: Boolean(options.forceRefresh),
+        forceNewRefresh: Boolean(options.forceNewRefresh)
       },
       () => {
         if (chrome.runtime.lastError) {
@@ -5228,9 +5238,25 @@ async function showSequencePicker(runId, linkedinUrl, options = {}) {
     let pageSequences = [];
     let selectedIndex = 0;
     let currentPage = 0;
+    let active = true;
     const startedAt = Date.now();
+    let cachedSignature = "";
+    let hasAppliedForceRefresh = false;
+
+    function getSequenceSignature(sequences) {
+      const normalized = Array.isArray(sequences) ? sequences : [];
+      if (normalized.length === 0) {
+        return "0";
+      }
+      const ids = normalized
+        .map((sequence) => String(sequence?.id || ""))
+        .filter(Boolean)
+        .sort();
+      return `${normalized.length}:${ids.join("|")}`;
+    }
 
     function cleanup() {
+      active = false;
       overlay.remove();
     }
 
@@ -5426,42 +5452,104 @@ async function showSequencePicker(runId, linkedinUrl, options = {}) {
       link: linkedinUrl
     });
 
-    listSequences("", runId, actionId)
+    listSequences("", runId, actionId, { preferCache: true })
       .then(async (sequences) => {
-        allSequences = sequences;
-        loading = false;
-        loadError = "";
-        renderSequences();
+        if (!active) {
+          return;
+        }
+        cachedSignature = getSequenceSignature(sequences);
+        if (sequences.length > 0 && !hasAppliedForceRefresh) {
+          allSequences = sequences;
+          loading = false;
+          loadError = "";
+          renderSequences();
+        }
         await logEvent({
           source: "extension.content",
-          event: "sequence_picker.loaded",
+          event: "sequence_picker.cache_loaded",
           actionId,
           runId,
-          message: `Sequence picker loaded ${allSequences.length} sequences.`,
-          link: linkedinUrl,
-          details: {
-            durationMs: Date.now() - startedAt
-          }
+          message: `Loaded ${sequences.length} cached sequences for picker.`,
+          link: linkedinUrl
         });
       })
-      .catch(async (error) => {
-        loading = false;
-        loadError = error.message || "Failed to load sequence list.";
-        renderSequences();
-        showToast(loadError, true);
+      .catch(async (_error) => {
+        if (!active) {
+          return;
+        }
         await logEvent({
           source: "extension.content",
-          level: "error",
-          event: "sequence_picker.load_failed",
+          level: "warn",
+          event: "sequence_picker.cache_load_failed",
           actionId,
           runId,
-          message: loadError,
-          link: linkedinUrl,
-          details: {
-            durationMs: Date.now() - startedAt
-          }
+          message: "Could not load cached sequences for picker.",
+          link: linkedinUrl
         });
       });
+
+    function runForceRefresh(isRetry = false) {
+      return listSequences("", runId, actionId, { forceRefresh: true, forceNewRefresh: true })
+        .then(async (sequences) => {
+          if (!active) {
+            return;
+          }
+          const refreshedSignature = getSequenceSignature(sequences);
+          hasAppliedForceRefresh = true;
+          allSequences = sequences;
+          loading = false;
+          loadError = "";
+          renderSequences();
+          await logEvent({
+            source: "extension.content",
+            event: isRetry ? "sequence_picker.retry_loaded" : "sequence_picker.loaded",
+            actionId,
+            runId,
+            message: `Sequence picker ${isRetry ? "retry " : ""}loaded ${allSequences.length} sequences.`,
+            link: linkedinUrl,
+            details: {
+              durationMs: Date.now() - startedAt
+            }
+          });
+
+          if (!isRetry && active && cachedSignature && refreshedSignature === cachedSignature) {
+            setTimeout(() => {
+              if (!active) {
+                return;
+              }
+              runForceRefresh(true).catch(() => {});
+            }, 900);
+          }
+        })
+        .catch(async (error) => {
+          if (!active) {
+            return;
+          }
+          const message = error.message || "Failed to refresh sequence list.";
+          const usedCachedSequences = allSequences.length > 0;
+          if (!usedCachedSequences) {
+            loading = false;
+            loadError = message;
+            renderSequences();
+            showToast(message, true);
+          }
+          await logEvent({
+            source: "extension.content",
+            level: usedCachedSequences ? "warn" : "error",
+            event: isRetry ? "sequence_picker.retry_failed" : "sequence_picker.load_failed",
+            actionId,
+            runId,
+            message,
+            link: linkedinUrl,
+            details: {
+              durationMs: Date.now() - startedAt,
+              usedCachedSequences
+            }
+          });
+        });
+    }
+
+    runForceRefresh(false).catch(() => {});
   });
 }
 

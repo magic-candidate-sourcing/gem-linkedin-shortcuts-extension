@@ -1273,8 +1273,15 @@ async function refreshSequencesFromBackend(settings, runId, limit = SEQUENCE_CAC
   return sequences;
 }
 
-function ensureSequenceRefresh(settings, runId, limit = SEQUENCE_CACHE_LIMIT, actionId = ACTIONS.SEND_SEQUENCE) {
-  if (!sequenceRefreshPromise) {
+function ensureSequenceRefresh(
+  settings,
+  runId,
+  limit = SEQUENCE_CACHE_LIMIT,
+  actionId = ACTIONS.SEND_SEQUENCE,
+  options = {}
+) {
+  const forceNew = Boolean(options.forceNew);
+  if (forceNew || !sequenceRefreshPromise) {
     sequenceRefreshPromise = refreshSequencesFromBackend(settings, runId, limit, actionId).finally(() => {
       sequenceRefreshPromise = null;
     });
@@ -3115,14 +3122,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const actionId = validActionIds.includes(requestedActionId) ? requestedActionId : ACTIONS.SEND_SEQUENCE;
         const query = String(message.query || "").trim();
         const limit = normalizeSequenceLimit(message.limit);
+        const forceRefresh = Boolean(message.forceRefresh);
+        const preferCache = Boolean(message.preferCache);
+        const forceNewRefresh = Boolean(message.forceNewRefresh);
         const cache = await getSequenceCache();
         let sequences = Array.isArray(cache.sequences) ? cache.sequences : [];
         const hadCache = sequences.length > 0;
         const cacheComplete = Boolean(cache.isComplete);
         const cacheFresh = isSequenceCacheFresh(cache);
 
-        if (sequences.length === 0) {
-          sequences = await ensureSequenceRefresh(settings, runId, limit, actionId);
+        if (forceRefresh) {
+          sequences = await ensureSequenceRefresh(settings, runId, limit, actionId, { forceNew: forceNewRefresh });
+        } else if (sequences.length === 0) {
+          if (preferCache) {
+            ensureSequenceRefresh(settings, runId, limit, actionId).catch(() => {});
+          } else {
+            sequences = await ensureSequenceRefresh(settings, runId, limit, actionId);
+          }
         } else if (!cacheFresh || !cacheComplete) {
           ensureSequenceRefresh(settings, runId, limit, actionId).catch(() => {});
         }
@@ -3130,7 +3146,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const usageMap = await getSequenceRecentUsage();
         let sorted = sortSequencesForPicker(sequences, usageMap, query);
 
-        if (query && (sorted.length === 0 || !cacheComplete)) {
+        if (!forceRefresh && query && (sorted.length === 0 || !cacheComplete)) {
           const refreshed = await ensureSequenceRefresh(settings, runId, limit, actionId);
           sorted = sortSequencesForPicker(refreshed, usageMap, query);
         }
@@ -3146,7 +3162,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             cacheCount: sequences.length,
             fromCache: hadCache,
             cacheFresh,
-            cacheComplete
+            cacheComplete,
+            forceRefresh,
+            preferCache,
+            forceNewRefresh
           }
         });
         sendResponse({ ok: true, sequences: trimmed, runId });
@@ -3381,13 +3400,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then(async (settings) => {
         const runId = message.runId || generateId();
         const limit = normalizeSequenceLimit(message.limit);
+        const forceRefresh = Boolean(message.forceRefresh);
+        const forceNewRefresh = Boolean(message.forceNewRefresh);
         const cache = await getSequenceCache();
-        if (cache.sequences.length > 0 && isSequenceCacheFresh(cache) && cache.isComplete) {
+        if (!forceRefresh && cache.sequences.length > 0 && isSequenceCacheFresh(cache) && cache.isComplete) {
           sendResponse({ ok: true, skipped: true, reason: "cache_fresh" });
           return;
         }
-        await ensureSequenceRefresh(settings, runId, limit, ACTIONS.SEND_SEQUENCE);
-        sendResponse({ ok: true, skipped: false });
+        await ensureSequenceRefresh(settings, runId, limit, ACTIONS.SEND_SEQUENCE, { forceNew: forceNewRefresh });
+        sendResponse({ ok: true, skipped: false, forced: forceRefresh, forceNewRefresh });
       })
       .catch((error) => sendResponse({ ok: false, message: error.message }));
     return true;
