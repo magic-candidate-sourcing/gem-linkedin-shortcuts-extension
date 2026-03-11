@@ -38,6 +38,7 @@ const CUSTOM_FIELD_MEMORY_CACHE_LIMIT = 40;
 const CUSTOM_FIELD_MEMORY_TTL_MS = 30 * 60 * 1000;
 const CANDIDATE_EMAIL_MEMORY_CACHE_LIMIT = 80;
 const CANDIDATE_EMAIL_MEMORY_TTL_MS = 30 * 60 * 1000;
+const PROJECT_MEMORY_TTL_MS = 30 * 60 * 1000;
 const PROFILE_URL_POLL_INTERVAL_MS = 300;
 const PROFILE_IDENTITY_RETRY_INTERVAL_MS = 1200;
 const GEM_ACTION_ACCESS_OPTIONS = [
@@ -57,6 +58,7 @@ const customFieldMemoryCache = new Map();
 const customFieldWarmPromises = new Map();
 const candidateEmailMemoryCache = new Map();
 const candidateEmailWarmPromises = new Map();
+let projectMemoryEntry = null;
 let lastPrefetchedProfileContextKey = "";
 let profileUrlPollTimerId = 0;
 let profileUrlPollLastUrl = "";
@@ -985,7 +987,9 @@ function listProjects(query, runId, options = {}) {
           reject(new Error(response?.message || "Could not load projects"));
           return;
         }
-        resolve(Array.isArray(response.projects) ? response.projects : []);
+        const projects = normalizeProjectsForPicker(response.projects);
+        setProjectMemoryProjects(projects);
+        resolve(projects);
       }
     );
   });
@@ -1051,9 +1055,13 @@ function createGemProject(name, description, privacyType, runId) {
           reject(new Error(response?.message || "Could not create project"));
           return;
         }
+        const project = normalizeProjectForPicker(response.project);
+        if (project) {
+          upsertProjectMemoryProject(project);
+        }
         resolve({
           message: String(response.message || ""),
-          project: response.project && typeof response.project === "object" ? response.project : {}
+          project: project || (response.project && typeof response.project === "object" ? response.project : {})
         });
       }
     );
@@ -1635,6 +1643,75 @@ function filterProjectsByQuery(projects, query) {
     return normalized;
   }
   return normalized.filter((project) => String(project?.name || "").toLowerCase().includes(normalizedQuery));
+}
+
+function normalizeProjectForPicker(item) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const id = String(item.id || "").trim();
+  if (!id) {
+    return null;
+  }
+  return {
+    id,
+    name: String(item.name || "").trim(),
+    archived: Boolean(item.archived),
+    createdAt: String(item.createdAt || item.created_at || item.created || "").trim()
+  };
+}
+
+function normalizeProjectsForPicker(items) {
+  const byId = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    const normalized = normalizeProjectForPicker(item);
+    if (!normalized) {
+      continue;
+    }
+    byId.set(normalized.id, normalized);
+  }
+  return Array.from(byId.values());
+}
+
+function getProjectMemoryEntry() {
+  const entry = projectMemoryEntry;
+  if (!entry) {
+    return { entry: null, isFresh: false };
+  }
+  return {
+    entry,
+    isFresh: Date.now() - Number(entry.fetchedAt || 0) <= PROJECT_MEMORY_TTL_MS
+  };
+}
+
+function setProjectMemoryProjects(projects) {
+  projectMemoryEntry = {
+    fetchedAt: Date.now(),
+    projects: normalizeProjectsForPicker(projects)
+  };
+}
+
+function upsertProjectMemoryProject(project) {
+  const normalized = normalizeProjectForPicker(project);
+  if (!normalized) {
+    return;
+  }
+  const current = getProjectMemoryEntry().entry;
+  const byId = new Map();
+  for (const item of current?.projects || []) {
+    const existing = normalizeProjectForPicker(item);
+    if (!existing) {
+      continue;
+    }
+    byId.set(existing.id, existing);
+  }
+  const existing = byId.get(normalized.id) || null;
+  byId.set(normalized.id, {
+    ...existing,
+    ...normalized,
+    createdAt: normalized.createdAt || existing?.createdAt || new Date().toISOString()
+  });
+  setProjectMemoryProjects(Array.from(byId.values()));
 }
 
 function prefetchProjects(runId, options = {}) {
@@ -6228,9 +6305,11 @@ async function showGemProjectNavigator(runId) {
     overlay.appendChild(modal);
     document.documentElement.appendChild(overlay);
 
-    let loading = true;
+    const projectMemory = getProjectMemoryEntry();
+    const hasProjectMemory = Boolean(projectMemory.entry);
+    let loading = !hasProjectMemory;
     let loadError = "";
-    let allProjects = [];
+    let allProjects = hasProjectMemory ? normalizeProjectsForPicker(projectMemory.entry.projects) : [];
     let selectedIndex = 0;
     let visibleRows = [];
     let active = true;
@@ -6416,29 +6495,33 @@ async function showGemProjectNavigator(runId) {
       link: window.location.href
     });
 
-    listProjects("", runId, { preferCache: true })
-      .then(async (projects) => {
-        if (!active) {
-          return;
-        }
-        const cached = projects.filter((project) => !project.archived);
-        cachedSignature = getProjectSignature(cached);
-        if (cached.length > 0 && !hasAppliedForceRefresh) {
-          allProjects = cached;
-          loading = false;
-          loadError = "";
-          renderList();
-        }
-        await logEvent({
-          source: "extension.content",
-          event: "gem_actions.project_search.cache_loaded",
-          actionId: ACTIONS.GEM_ACTIONS,
-          runId,
-          message: `Loaded ${cached.length} cached projects for navigation.`,
-          link: window.location.href
-        });
-      })
-      .catch(() => {});
+    if (!hasProjectMemory) {
+      listProjects("", runId, { preferCache: true })
+        .then(async (projects) => {
+          if (!active) {
+            return;
+          }
+          const cached = projects.filter((project) => !project.archived);
+          cachedSignature = getProjectSignature(cached);
+          if (cached.length > 0 && !hasAppliedForceRefresh) {
+            allProjects = cached;
+            loading = false;
+            loadError = "";
+            renderList();
+          }
+          await logEvent({
+            source: "extension.content",
+            event: "gem_actions.project_search.cache_loaded",
+            actionId: ACTIONS.GEM_ACTIONS,
+            runId,
+            message: `Loaded ${cached.length} cached projects for navigation.`,
+            link: window.location.href
+          });
+        })
+        .catch(() => {});
+    } else {
+      cachedSignature = getProjectSignature(allProjects.filter((project) => !project.archived));
+    }
 
     function runForceRefresh(isRetry = false) {
       return listProjects("", runId, { forceRefresh: true, forceNewRefresh: true })
@@ -7236,10 +7319,12 @@ async function showProjectPicker(runId, linkedinUrl) {
     overlay.appendChild(modal);
     document.documentElement.appendChild(overlay);
 
+    const projectMemory = getProjectMemoryEntry();
+    const hasProjectMemory = Boolean(projectMemory.entry);
     let selectedIndex = 0;
     let filteredProjects = [];
-    let allProjects = [];
-    let loading = true;
+    let allProjects = hasProjectMemory ? normalizeProjectsForPicker(projectMemory.entry.projects) : [];
+    let loading = !hasProjectMemory;
     let loadError = "";
     const startedAt = Date.now();
     let active = true;
@@ -7412,42 +7497,46 @@ async function showProjectPicker(runId, linkedinUrl) {
       link: linkedinUrl
     });
 
-    listProjects("", runId, { preferCache: true })
-      .then(async (projects) => {
-        if (!active) {
-          return;
-        }
-        const cachedProjects = projects.filter((project) => !project.archived);
-        cachedSignature = getProjectSignature(cachedProjects);
-        if (cachedProjects.length > 0 && !hasAppliedForceRefresh) {
-          allProjects = cachedProjects;
-          loading = false;
-          loadError = "";
-          renderList();
-        }
-        await logEvent({
-          source: "extension.content",
-          event: "project_picker.cache_loaded",
-          actionId: ACTIONS.ADD_TO_PROJECT,
-          runId,
-          message: `Loaded ${cachedProjects.length} cached projects for picker.`,
-          link: linkedinUrl
+    if (!hasProjectMemory) {
+      listProjects("", runId, { preferCache: true })
+        .then(async (projects) => {
+          if (!active) {
+            return;
+          }
+          const cachedProjects = projects.filter((project) => !project.archived);
+          cachedSignature = getProjectSignature(cachedProjects);
+          if (cachedProjects.length > 0 && !hasAppliedForceRefresh) {
+            allProjects = cachedProjects;
+            loading = false;
+            loadError = "";
+            renderList();
+          }
+          await logEvent({
+            source: "extension.content",
+            event: "project_picker.cache_loaded",
+            actionId: ACTIONS.ADD_TO_PROJECT,
+            runId,
+            message: `Loaded ${cachedProjects.length} cached projects for picker.`,
+            link: linkedinUrl
+          });
+        })
+        .catch(async (_error) => {
+          if (!active) {
+            return;
+          }
+          await logEvent({
+            source: "extension.content",
+            level: "warn",
+            event: "project_picker.cache_load_failed",
+            actionId: ACTIONS.ADD_TO_PROJECT,
+            runId,
+            message: "Could not load cached projects for picker.",
+            link: linkedinUrl
+          });
         });
-      })
-      .catch(async (_error) => {
-        if (!active) {
-          return;
-        }
-        await logEvent({
-          source: "extension.content",
-          level: "warn",
-          event: "project_picker.cache_load_failed",
-          actionId: ACTIONS.ADD_TO_PROJECT,
-          runId,
-          message: "Could not load cached projects for picker.",
-          link: linkedinUrl
-        });
-      });
+    } else {
+      cachedSignature = getProjectSignature(allProjects.filter((project) => !project.archived));
+    }
 
     function runForceRefresh(isRetry = false) {
       return listProjects("", runId, { forceRefresh: true, forceNewRefresh: true })

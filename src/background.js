@@ -39,6 +39,7 @@ const ORG_DEFAULT_SETTINGS_KEYS = [
   "sequenceComposeUrlTemplate"
 ];
 let projectRefreshPromise = null;
+let projectCacheGeneration = 0;
 let sequenceRefreshPromise = null;
 const customFieldRefreshPromises = new Map();
 const candidateEmailRefreshPromises = new Map();
@@ -391,6 +392,43 @@ function isProjectCacheFresh(cache) {
     return false;
   }
   return Date.now() - cache.fetchedAt <= PROJECT_CACHE_TTL_MS;
+}
+
+function bumpProjectCacheGeneration() {
+  projectCacheGeneration += 1;
+  return projectCacheGeneration;
+}
+
+async function upsertProjectCache(project, options = {}) {
+  const normalized = normalizeProject(project);
+  if (!normalized) {
+    return null;
+  }
+
+  const mutationGeneration = bumpProjectCacheGeneration();
+  const cache = await getProjectCache();
+  const byId = new Map();
+  for (const item of Array.isArray(cache.projects) ? cache.projects : []) {
+    const existing = normalizeProject(item);
+    if (!existing) {
+      continue;
+    }
+    byId.set(existing.id, existing);
+  }
+
+  const existing = byId.get(normalized.id) || null;
+  byId.set(normalized.id, {
+    ...existing,
+    ...normalized,
+    createdAt: normalized.createdAt || existing?.createdAt || String(options.createdAt || new Date().toISOString())
+  });
+
+  const nextIsComplete = Object.prototype.hasOwnProperty.call(options, "isComplete")
+    ? Boolean(options.isComplete)
+    : Boolean(cache.isComplete);
+  const projects = Array.from(byId.values());
+  await setProjectCache(projects, { isComplete: nextIsComplete, generation: mutationGeneration });
+  return byId.get(normalized.id) || normalized;
 }
 
 async function getProjectRecentUsage() {
@@ -994,9 +1032,10 @@ async function touchAshbyJobRecentUsage(jobId, jobName = "") {
   await setAshbyJobRecentUsage(pruned);
 }
 
-async function refreshProjectsFromBackend(settings, runId, limit = PROJECT_CACHE_LIMIT) {
+async function refreshProjectsFromBackend(settings, runId, limit = PROJECT_CACHE_LIMIT, options = {}) {
   const actionId = ACTIONS.ADD_TO_PROJECT;
   const normalizedLimit = normalizeProjectLimit(limit);
+  const refreshGeneration = Number(options.generation) || bumpProjectCacheGeneration();
   const data = await callBackend(
     "/api/projects/list",
     {
@@ -1007,14 +1046,19 @@ async function refreshProjectsFromBackend(settings, runId, limit = PROJECT_CACHE
     { actionId, runId, step: "listProjects" }
   );
   const projects = Array.isArray(data?.projects) ? data.projects.map(normalizeProject).filter(Boolean) : [];
-  await setProjectCache(projects, { isComplete: normalizedLimit === 0 });
+  const shouldWriteCache = refreshGeneration === projectCacheGeneration;
+  if (shouldWriteCache) {
+    await setProjectCache(projects, { isComplete: normalizedLimit === 0, generation: refreshGeneration });
+  }
   logEvent(settings, {
     event: "projects.cache.refreshed",
     actionId,
     runId,
     message: `Refreshed project cache with ${projects.length} projects.`,
     details: {
-      limit: normalizedLimit
+      limit: normalizedLimit,
+      refreshGeneration,
+      wroteCache: shouldWriteCache
     }
   });
   return projects;
@@ -1023,9 +1067,15 @@ async function refreshProjectsFromBackend(settings, runId, limit = PROJECT_CACHE
 function ensureProjectRefresh(settings, runId, limit = PROJECT_CACHE_LIMIT, options = {}) {
   const forceNew = Boolean(options.forceNew);
   if (forceNew || !projectRefreshPromise) {
-    projectRefreshPromise = refreshProjectsFromBackend(settings, runId, limit).finally(() => {
-      projectRefreshPromise = null;
+    const refreshGeneration = bumpProjectCacheGeneration();
+    const refreshPromise = refreshProjectsFromBackend(settings, runId, limit, {
+      generation: refreshGeneration
+    }).finally(() => {
+      if (projectRefreshPromise === refreshPromise) {
+        projectRefreshPromise = null;
+      }
     });
+    projectRefreshPromise = refreshPromise;
   }
   return projectRefreshPromise;
 }
@@ -2957,7 +3007,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           runId,
           step: "createProject"
         });
-        const project = data?.project || {};
+        const createdAt = String(data?.project?.createdAt || new Date().toISOString());
+        const createdProject = data?.project && typeof data.project === "object" ? data.project : {};
+        const cachedProject = await upsertProjectCache(
+          {
+            ...createdProject,
+            createdAt
+          },
+          {
+            createdAt
+          }
+        );
+        const project = {
+          ...createdProject,
+          ...(cachedProject || {}),
+          createdAt,
+          url: String(createdProject.url || buildGemProjectUrl(cachedProject?.id || createdProject.id, cachedProject?.name || createdProject.name) || "")
+        };
+        if (project?.id) {
+          await touchProjectRecentUsage(project.id, project.name || "");
+        }
         sendResponse({
           ok: true,
           runId,
@@ -2967,6 +3036,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             name: String(project.name || ""),
             privacyType: String(project.privacyType || ""),
             description: String(project.description || ""),
+            createdAt: String(project.createdAt || ""),
             url: String(project.url || buildGemProjectUrl(project.id, project.name) || "")
           }
         });

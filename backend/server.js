@@ -1442,6 +1442,7 @@ async function createProject(payload, audit) {
       name: String(project?.name || name).trim(),
       privacyType: String(project?.privacy_type || privacyType).trim(),
       description: String(project?.description || description).trim(),
+      createdAt: String(project?.created_at || project?.createdAt || project?.created || "").trim(),
       url: buildGemProjectUrl(project?.id, project?.name || name)
     }
   };
