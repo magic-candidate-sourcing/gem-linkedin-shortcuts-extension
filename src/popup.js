@@ -4,6 +4,13 @@ const enabledCheckbox = document.getElementById("enabled");
 const gemStatusDisplayModeSelect = document.getElementById("gemStatusDisplayMode");
 const statusEl = document.getElementById("status");
 const optionsBtn = document.getElementById("open-options");
+const CONTENT_SCRIPT_FILES = ["src/shared.js", "src/content.js"];
+const SUPPORTED_TAB_PATTERNS = [
+  /^https:\/\/www\.linkedin\.com\/(?:in|pub)\//i,
+  /^https:\/\/www\.linkedin\.com\/talent(?:\/[^/]+)?\/profile\//i,
+  /^https:\/\/(?:www|app)\.gem\.com\/(?:candidate|projects)\//i,
+  /^https:\/\/github\.com\//i
+];
 
 function generateRunId() {
   if (crypto && crypto.randomUUID) {
@@ -25,6 +32,11 @@ function getUnsupportedTabMessage() {
   return "Open a LinkedIn, Gem candidate, Gem project, or GitHub profile tab and retry. If that tab is already supported, refresh it after the extension update.";
 }
 
+function isSupportedTabUrl(url) {
+  const value = String(url || "").trim();
+  return SUPPORTED_TAB_PATTERNS.some((pattern) => pattern.test(value));
+}
+
 function sendRuntimeMessage(payload) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage(payload, (response) => {
@@ -37,26 +49,89 @@ function sendRuntimeMessage(payload) {
   });
 }
 
-async function getCurrentTabId() {
+function sendTabMessage(tabId, payload) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, payload, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+async function getCurrentTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs?.[0]?.id;
+  return tabs?.[0] || null;
+}
+
+function pingContent(tabId) {
+  return sendTabMessage(tabId, { type: "PING" });
+}
+
+function injectContentScripts(tabId) {
+  return chrome.scripting.executeScript({
+    target: { tabId },
+    files: CONTENT_SCRIPT_FILES
+  });
+}
+
+async function ensureContentScriptReady(tab) {
+  const tabId = Number(tab?.id);
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    throw new Error("No active tab found.");
+  }
+
+  try {
+    const response = await pingContent(tabId);
+    if (response?.ok) {
+      return;
+    }
+  } catch (error) {
+    if (!isRecoverableContentError(error.message || "")) {
+      throw error;
+    }
+  }
+
+  const tabUrl = String(tab?.url || "").trim();
+  if (tabUrl && !isSupportedTabUrl(tabUrl)) {
+    throw new Error(getUnsupportedTabMessage());
+  }
+
+  try {
+    await injectContentScripts(tabId);
+  } catch (_error) {
+    throw new Error(getUnsupportedTabMessage());
+  }
+
+  const response = await pingContent(tabId);
+  if (!response?.ok) {
+    throw new Error("Couldn't initialize the page helper. Reload the tab and retry.");
+  }
 }
 
 function sendActionToContent(tabId, actionId) {
   const runId = generateRunId();
-  return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(
-      tabId,
-      { type: "TRIGGER_ACTION", actionId, source: "popup", runId },
-      (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        resolve(response);
-      }
-    );
-  });
+  return sendTabMessage(tabId, { type: "TRIGGER_ACTION", actionId, source: "popup", runId });
+}
+
+async function syncSettingsToActiveTab(settings) {
+  const activeTab = await getCurrentTab();
+  if (!activeTab || !isSupportedTabUrl(activeTab.url || "")) {
+    return;
+  }
+  await ensureContentScriptReady(activeTab);
+  await sendTabMessage(activeTab.id, { type: "SETTINGS_UPDATED", settings });
+}
+
+async function repairActiveTabIfSupported() {
+  const activeTab = await getCurrentTab();
+  if (!activeTab || !isSupportedTabUrl(activeTab.url || "")) {
+    return false;
+  }
+  await ensureContentScriptReady(activeTab);
+  return true;
 }
 
 async function loadState() {
@@ -89,6 +164,7 @@ async function updateSettingsPatch(patch, successMessage, successEvent, failureE
     if (!saveResponse?.ok) {
       throw new Error(saveResponse?.message || "Could not save settings");
     }
+    syncSettingsToActiveTab(settings).catch(() => {});
     setStatus(successMessage);
     sendRuntimeMessage({
       type: "LOG_EVENT",
@@ -138,10 +214,9 @@ document.querySelectorAll("button[data-action]").forEach((button) => {
   button.addEventListener("click", async () => {
     const actionId = button.getAttribute("data-action");
     try {
-      const tabId = await getCurrentTabId();
-      if (!tabId) {
-        throw new Error("No active tab found.");
-      }
+      const activeTab = await getCurrentTab();
+      await ensureContentScriptReady(activeTab);
+      const tabId = Number(activeTab?.id);
       await sendActionToContent(tabId, actionId);
       setStatus("Action sent.");
     } catch (error) {
@@ -169,4 +244,6 @@ optionsBtn.addEventListener("click", () => {
   chrome.runtime.openOptionsPage();
 });
 
-loadState().catch((error) => setStatus(error.message, true));
+loadState()
+  .then(() => repairActiveTabIfSupported().catch(() => {}))
+  .catch((error) => setStatus(error.message, true));

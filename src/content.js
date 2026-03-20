@@ -81,6 +81,7 @@ let profileIdentityCache = {
   pageUrl: "",
   linkedinUrl: "",
   linkedInHandle: "",
+  gemCandidateId: "",
   resolvedAtMs: 0
 };
 
@@ -443,13 +444,46 @@ function refreshProfileIdentityFromDom(options = {}) {
     return;
   }
 
+  const previousLinkedinUrl = String(profileIdentityCache.linkedinUrl || "").trim();
+  const previousLinkedInHandle = String(profileIdentityCache.linkedInHandle || "")
+    .trim()
+    .toLowerCase();
   const linkedinUrl = findLinkedInPublicProfileUrlInDom();
+  const linkedInHandle = getLinkedInHandle(linkedinUrl);
+  const normalizedNextHandle = String(linkedInHandle || "")
+    .trim()
+    .toLowerCase();
+  const sameProfile =
+    profileIdentityCache.pageUrl === pageUrl ||
+    (previousLinkedinUrl && linkedinUrl && previousLinkedinUrl === linkedinUrl) ||
+    (previousLinkedInHandle && normalizedNextHandle && previousLinkedInHandle === normalizedNextHandle);
   profileIdentityCache = {
     pageUrl,
     linkedinUrl,
-    linkedInHandle: getLinkedInHandle(linkedinUrl),
+    linkedInHandle,
+    gemCandidateId: sameProfile ? String(profileIdentityCache.gemCandidateId || "").trim() : "",
     resolvedAtMs: Date.now()
   };
+}
+
+function applyGemCandidateHintToContext(context) {
+  const base = context && typeof context === "object" ? context : {};
+  const gemCandidateId = String(base.gemCandidateId || profileIdentityCache.gemCandidateId || "").trim();
+  if (!gemCandidateId) {
+    return { ...base };
+  }
+  return {
+    ...base,
+    gemCandidateId
+  };
+}
+
+function rememberGemCandidateIdForCurrentLinkedInPage(candidateId) {
+  const normalized = String(candidateId || "").trim();
+  if (!normalized || !isLinkedInProfilePage()) {
+    return;
+  }
+  profileIdentityCache.gemCandidateId = normalized;
 }
 
 function getLinkedInProfileContext() {
@@ -1863,7 +1897,7 @@ function maybeRefreshGemStatusLive(options = {}) {
   if (!force && gemStatusLiveRefreshNextAtMs > now) {
     return;
   }
-  const context = options.context || getProfileContext();
+  const context = applyGemCandidateHintToContext(options.context || getProfileContext());
   if (!contextHasResolvableIdentity(context)) {
     scheduleGemStatusLiveRefresh(500);
     return;
@@ -2123,6 +2157,7 @@ function renderGemStatusIndicator(context, data) {
     hideGemStatusIndicator();
     return;
   }
+  rememberGemCandidateIdForCurrentLinkedInPage(candidateId);
   const statusField = findGemStatusField(data?.customFields);
   if (!statusField) {
     hideGemStatusIndicator();
@@ -2157,7 +2192,7 @@ function renderGemStatusIndicator(context, data) {
 
 async function refreshGemStatusIndicator(options = {}) {
   const settings = cachedSettings || DEFAULT_SETTINGS;
-  const context = options.context || getProfileContext();
+  const context = applyGemCandidateHintToContext(options.context || getProfileContext());
   const isStatusEnabled = Boolean(settings.enabled) && isCurrentGemStatusDisplayEnabled(settings);
   if (!isStatusEnabled || !isLinkedInProfilePage()) {
     resetGemStatusIndicator();
@@ -2202,7 +2237,7 @@ async function refreshGemStatusIndicator(options = {}) {
       if (requestId !== gemStatusIndicatorRequestId) {
         return;
       }
-      const liveContextKey = getCustomFieldContextKey(getProfileContext());
+      const liveContextKey = getCustomFieldContextKey(applyGemCandidateHintToContext(getProfileContext()));
       if (liveContextKey !== contextKey || !cachedSettings?.enabled || !isCurrentGemStatusDisplayEnabled(cachedSettings) || !isLinkedInProfilePage()) {
         return;
       }
@@ -9563,7 +9598,7 @@ function applyGemStatusDisplayModeLocally(mode, runId = "") {
   if (!isLinkedInProfilePage()) {
     return;
   }
-  const context = getProfileContext();
+  const context = applyGemCandidateHintToContext(getProfileContext());
   if (gemStatusIndicatorElements?.root?.isConnected) {
     gemStatusIndicatorElements.root.dataset.displayMode = nextMode;
   }
@@ -11228,9 +11263,35 @@ async function init() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "PING") {
+    sendResponse({ ok: true });
+    return false;
+  }
+
   if (message?.type === "GEM_STATUS_MAY_HAVE_CHANGED") {
     if (cachedSettings?.enabled && isCurrentGemStatusDisplayEnabled(cachedSettings) && isLinkedInProfilePage()) {
-      const context = getProfileContext();
+      const liveContext = getProfileContext();
+      const messageContext = message.context && typeof message.context === "object" ? message.context : {};
+      const hintedCandidateId = String(messageContext.gemCandidateId || "").trim();
+      if (hintedCandidateId) {
+        rememberGemCandidateIdForCurrentLinkedInPage(hintedCandidateId);
+      }
+      const context = applyGemCandidateHintToContext({
+        ...messageContext,
+        ...liveContext,
+        pageUrl: liveContext.pageUrl || messageContext.pageUrl || "",
+        profileUrl: liveContext.profileUrl || messageContext.profileUrl || "",
+        linkedinUrl: liveContext.linkedinUrl || messageContext.linkedinUrl || "",
+        linkedInHandle: liveContext.linkedInHandle || messageContext.linkedInHandle || "",
+        contactEmail: liveContext.contactEmail || messageContext.contactEmail || "",
+        contactEmails:
+          Array.isArray(liveContext.contactEmails) && liveContext.contactEmails.length > 0
+            ? liveContext.contactEmails
+            : Array.isArray(messageContext.contactEmails)
+              ? messageContext.contactEmails
+              : [],
+        gemCandidateId: hintedCandidateId
+      });
       scheduleGemStatusBootstrapRefreshes(context);
       scheduleGemStatusLiveRefresh(0);
       maybeRefreshGemStatusLive({

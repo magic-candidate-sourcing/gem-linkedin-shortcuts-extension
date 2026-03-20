@@ -1,10 +1,12 @@
 {
   "manifest_version": 3,
   "name": "Gem LinkedIn Shortcuts",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Run Gem and Ashby recruiting actions from LinkedIn, Gem, and GitHub profiles.",
   "permissions": [
-    "storage"
+    "storage",
+    "activeTab",
+    "scripting"
   ],
   "host_permissions": [
     "https://gem-linkedin-shortcuts-extension.onrender.com/*",
@@ -40,6 +42,8 @@
         "https://www.linkedin.com/talent/*/profile/*",
         "https://www.gem.com/candidate/*",
         "https://app.gem.com/candidate/*",
+        "https://www.gem.com/projects/*",
+        "https://app.gem.com/projects/*",
         "https://github.com/*"
       ],
       "exclude_matches": [
