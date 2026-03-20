@@ -13,6 +13,7 @@ const createdByUserIdInput = document.getElementById("createdByUserId");
 const createdByUserEmailInput = document.getElementById("createdByUserEmail");
 const gemUserSelectEl = document.getElementById("gemUserSelect");
 const loadGemUsersBtn = document.getElementById("load-gem-users");
+const gemStatusDisplayModeSelect = document.getElementById("gemStatusDisplayMode");
 
 let activeShortcutEditor = null;
 let latestRenderedLogs = [];
@@ -116,10 +117,12 @@ function readInputs() {
 
 function writeInputs(settings) {
   document.getElementById("enabled").checked = !!settings.enabled;
-  document.getElementById("gemStatusDisplayMode").value = normalizeGemStatusDisplayMode(
+  const normalizedMode = normalizeGemStatusDisplayMode(
     settings.gemStatusDisplayMode,
     settings.showGemStatusBadge !== false
   );
+  document.getElementById("gemStatusDisplayMode").value = normalizedMode;
+  document.getElementById("gemStatusDisplayMode").dataset.current = normalizedMode;
   document.getElementById("backendBaseUrl").value = settings.backendBaseUrl || "";
   document.getElementById("backendSharedToken").value = settings.backendSharedToken || "";
   document.getElementById("createdByUserId").value = settings.createdByUserId || "";
@@ -156,6 +159,22 @@ function writeInputs(settings) {
   // Retired for now:
   // setShortcutValue("viewActivityFeed", settings.shortcuts.viewActivityFeed || "");
   syncUserPickerFromCurrentIdentity();
+}
+
+async function saveGemStatusDisplayModeImmediately(rawMode) {
+  const nextMode = normalizeGemStatusDisplayMode(rawMode, true);
+  const response = await sendRuntimeMessage({ type: "GET_SETTINGS" });
+  if (!response?.ok) {
+    throw new Error(response?.message || "Could not load settings");
+  }
+  const settings = deepMerge(DEFAULT_SETTINGS, response.settings || {});
+  settings.gemStatusDisplayMode = nextMode;
+  settings.showGemStatusBadge = isGemStatusDisplayEnabled(nextMode);
+  const saveResponse = await sendRuntimeMessage({ type: "SAVE_SETTINGS", settings });
+  if (!saveResponse?.ok) {
+    throw new Error(saveResponse?.message || "Could not save settings");
+  }
+  return nextMode;
 }
 
 function validateSettings(settings) {
@@ -619,6 +638,23 @@ createdByUserIdInput.addEventListener("input", () => {
 
 createdByUserEmailInput.addEventListener("input", () => {
   syncUserPickerFromCurrentIdentity();
+});
+
+gemStatusDisplayModeSelect.addEventListener("change", () => {
+  const previousMode = normalizeGemStatusDisplayMode(gemStatusDisplayModeSelect.dataset.current || "", true);
+  const selectedMode = normalizeGemStatusDisplayMode(gemStatusDisplayModeSelect.value, true);
+  setStatus("Saving Gem status display mode...");
+  saveGemStatusDisplayModeImmediately(selectedMode)
+    .then((savedMode) => {
+      gemStatusDisplayModeSelect.value = savedMode;
+      gemStatusDisplayModeSelect.dataset.current = savedMode;
+      setStatus(`Gem status display set to ${formatGemStatusDisplayModeLabel(savedMode)}.`);
+    })
+    .catch((error) => {
+      gemStatusDisplayModeSelect.value = previousMode;
+      gemStatusDisplayModeSelect.dataset.current = previousMode;
+      setStatus(error.message || "Could not save Gem status display mode.", true);
+    });
 });
 
 document.addEventListener("keydown", handleShortcutRecord, true);

@@ -9554,35 +9554,51 @@ function isCycleGemStatusDisplayModeShortcut(event) {
   return isConfiguredShortcut(event, GEM_STATUS_DISPLAY_MODE_SHORTCUT_ID);
 }
 
+function applyGemStatusDisplayModeLocally(mode, runId = "") {
+  const nextMode = normalizeGemStatusDisplayMode(mode, true);
+  if (!isGemStatusDisplayEnabled(nextMode)) {
+    resetGemStatusIndicator();
+    return;
+  }
+  if (!isLinkedInProfilePage()) {
+    return;
+  }
+  const context = getProfileContext();
+  if (gemStatusIndicatorElements?.root?.isConnected) {
+    gemStatusIndicatorElements.root.dataset.displayMode = nextMode;
+  }
+  const memoryEntry = getCustomFieldMemoryEntry(context);
+  if (memoryEntry.entry && String(memoryEntry.entry.candidateId || "").trim()) {
+    renderGemStatusIndicator(context, memoryEntry.entry);
+  }
+  scheduleGemStatusBootstrapRefreshes(context);
+  scheduleGemStatusLiveRefresh(0);
+  maybeRefreshGemStatusLive({
+    context,
+    force: true,
+    forceRefresh: true,
+    runId: runId || generateRunId()
+  });
+}
+
 async function cycleGemStatusDisplayModeSetting(
   runId,
   shortcutLabel = getConfiguredShortcutLabel(GEM_STATUS_DISPLAY_MODE_SHORTCUT_ID)
 ) {
   const currentSettings = cachedSettings || (await refreshSettings());
+  const previousSettings = deepMerge(DEFAULT_SETTINGS, currentSettings || {});
   const currentMode = getCurrentGemStatusDisplayMode(currentSettings);
   const nextMode = cycleGemStatusDisplayMode(currentMode);
   const nextSettings = deepMerge(DEFAULT_SETTINGS, currentSettings || {});
   nextSettings.gemStatusDisplayMode = nextMode;
   nextSettings.showGemStatusBadge = isGemStatusDisplayEnabled(nextMode);
 
-  await saveSettings(nextSettings);
   cachedSettings = deepMerge(DEFAULT_SETTINGS, nextSettings);
-
-  if (!isGemStatusDisplayEnabled(nextMode)) {
-    resetGemStatusIndicator();
-  } else if (isLinkedInProfilePage()) {
-    prefetchPickersForCurrentProfile();
-    scheduleGemStatusLiveRefresh(0);
-    maybeRefreshGemStatusLive({
-      force: true,
-      forceRefresh: true,
-      runId
-    });
-  }
+  applyGemStatusDisplayModeLocally(nextMode, runId);
 
   const nextLabel = formatGemStatusDisplayModeLabel(nextMode);
   showToast(`Gem status display: ${nextLabel}.`);
-  await logEvent({
+  logEvent({
     source: "extension.content",
     event: "gem_status.display_mode.cycled",
     runId,
@@ -9593,6 +9609,25 @@ async function cycleGemStatusDisplayModeSetting(
       toMode: nextMode,
       shortcut: shortcutLabel
     }
+  }).catch(() => {});
+
+  saveSettings(nextSettings).catch((error) => {
+    cachedSettings = deepMerge(DEFAULT_SETTINGS, previousSettings);
+    applyGemStatusDisplayModeLocally(getCurrentGemStatusDisplayMode(previousSettings), runId);
+    showToast(error.message || "Could not persist Gem status display mode.", true);
+    logEvent({
+      source: "extension.content",
+      level: "error",
+      event: "gem_status.display_mode.persist_failed",
+      runId,
+      message: error.message || "Could not persist Gem status display mode.",
+      link: window.location.href,
+      details: {
+        attemptedMode: nextMode,
+        fallbackMode: getCurrentGemStatusDisplayMode(previousSettings),
+        shortcut: shortcutLabel
+      }
+    }).catch(() => {});
   });
 }
 
