@@ -25,6 +25,11 @@ const CUSTOM_FIELD_CACHE_LIMIT = 200;
 const CANDIDATE_EMAIL_CACHE_KEY = "candidateEmailPickerCache";
 const CANDIDATE_EMAIL_CACHE_TTL_MS = 10 * 60 * 1000;
 const CANDIDATE_EMAIL_CACHE_LIMIT = 200;
+const SHARED_RUNTIME_FILE = "src/shared.js";
+const CONTENT_RUNTIME_FILES = Object.freeze(["src/content.js"]);
+const CANDIDATE_RESOLUTION_TTL_MS = 2 * 60 * 1000;
+const CANDIDATE_RESOLUTION_NEGATIVE_TTL_MS = 1500;
+const CANDIDATE_RESOLUTION_CACHE_LIMIT = 300;
 const ORG_DEFAULTS_PATH = "src/org-defaults.json";
 const ORG_DEFAULT_SETTINGS_KEYS = [
   "backendBaseUrl",
@@ -43,9 +48,27 @@ let projectCacheGeneration = 0;
 let sequenceRefreshPromise = null;
 const customFieldRefreshPromises = new Map();
 const candidateEmailRefreshPromises = new Map();
+const candidateResolutionCache = new Map();
 let orgDefaultsPromise = null;
 let orgDefaultsBootstrapPromise = null;
 let orgDefaultsBootstrapped = false;
+let cachedSettingsValue = null;
+let cachedSettingsPromise = null;
+let localLogsCache = null;
+
+function cloneSettingsForReturn(settings) {
+  return normalizeSettings(deepMerge(DEFAULT_SETTINGS, settings || {}));
+}
+
+function setSettingsCache(settings) {
+  cachedSettingsValue = cloneSettingsForReturn(settings);
+  cachedSettingsPromise = Promise.resolve(cachedSettingsValue);
+}
+
+function invalidateSettingsCache() {
+  cachedSettingsValue = null;
+  cachedSettingsPromise = null;
+}
 
 function generateId() {
   if (crypto && crypto.randomUUID) {
@@ -86,16 +109,26 @@ function redactForLog(value, depth = 0) {
 
 async function getSettings() {
   await ensureOrgDefaultsBootstrapped("getSettings");
-  return new Promise((resolve) => {
-    chrome.storage.sync.get("settings", (data) => {
-      resolve(normalizeSettings(deepMerge(DEFAULT_SETTINGS, data.settings || {})));
+  if (cachedSettingsValue) {
+    return cloneSettingsForReturn(cachedSettingsValue);
+  }
+  if (!cachedSettingsPromise) {
+    cachedSettingsPromise = new Promise((resolve) => {
+      chrome.storage.sync.get("settings", (data) => {
+        const normalized = normalizeSettings(deepMerge(DEFAULT_SETTINGS, data.settings || {}));
+        cachedSettingsValue = normalized;
+        resolve(normalized);
+      });
     });
-  });
+  }
+  const settings = await cachedSettingsPromise;
+  return cloneSettingsForReturn(settings);
 }
 
 function saveSettings(settings) {
   const normalized = normalizeSettings(settings);
   validateBackendBaseUrlOrThrow(normalized.backendBaseUrl);
+  setSettingsCache(normalized);
   return new Promise((resolve) => {
     chrome.storage.sync.set({ settings: normalized }, () => resolve());
   });
@@ -367,23 +400,27 @@ function validateBackendBaseUrlOrThrow(rawValue) {
 }
 
 function getLocalLogs() {
+  if (Array.isArray(localLogsCache)) {
+    return Promise.resolve(localLogsCache.slice());
+  }
   return new Promise((resolve) => {
     chrome.storage.local.get(LOCAL_LOG_KEY, (data) => {
-      resolve(Array.isArray(data[LOCAL_LOG_KEY]) ? data[LOCAL_LOG_KEY] : []);
+      localLogsCache = Array.isArray(data[LOCAL_LOG_KEY]) ? data[LOCAL_LOG_KEY] : [];
+      resolve(localLogsCache.slice());
     });
   });
 }
 
 function setLocalLogs(logs) {
+  localLogsCache = Array.isArray(logs) ? logs.slice() : [];
   return new Promise((resolve) => {
-    chrome.storage.local.set({ [LOCAL_LOG_KEY]: logs }, () => resolve());
+    chrome.storage.local.set({ [LOCAL_LOG_KEY]: localLogsCache }, () => resolve());
   });
 }
 
 async function appendLocalLog(entry) {
-  const current = await getLocalLogs();
-  current.push(entry);
-  const trimmed = current.slice(-LOCAL_LOG_LIMIT);
+  const current = Array.isArray(localLogsCache) ? localLogsCache.slice() : await getLocalLogs();
+  const trimmed = current.concat(entry).slice(-LOCAL_LOG_LIMIT);
   await setLocalLogs(trimmed);
 }
 
@@ -531,14 +568,27 @@ async function setAshbyJobRecentUsage(usage) {
 }
 
 function getCustomFieldCacheKey(context) {
-  const gemCandidateId = String(context?.gemCandidateId || "").trim();
-  if (gemCandidateId) {
-    return `candidate:${gemCandidateId}`;
+  return getCustomFieldCacheKeys(context)[0] || "";
+}
+
+function getCustomFieldCacheKeys(context = {}, candidateId = "") {
+  const keys = [];
+  const pushKey = (value) => {
+    const normalized = String(value || "").trim();
+    if (!normalized || keys.includes(normalized)) {
+      return;
+    }
+    keys.push(normalized);
+  };
+
+  const resolvedCandidateId = String(candidateId || context?.gemCandidateId || "").trim();
+  if (resolvedCandidateId) {
+    pushKey(`candidate:${resolvedCandidateId}`);
   }
 
   const handle = String(context?.linkedInHandle || "").trim().toLowerCase();
   if (handle) {
-    return `handle:${handle}`;
+    pushKey(`handle:${handle}`);
   }
 
   const rawUrl = String(context?.linkedinUrl || "").trim().toLowerCase();
@@ -547,31 +597,32 @@ function getCustomFieldCacheKey(context) {
       const parsed = new URL(rawUrl);
       parsed.search = "";
       parsed.hash = "";
-      return `url:${parsed.toString().replace(/\/$/, "")}`;
+      pushKey(`url:${parsed.toString().replace(/\/$/, "")}`);
     } catch (_error) {
-      return `url:${rawUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`;
+      pushKey(`url:${rawUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`);
     }
   }
 
   const email = collectContextEmails(context)[0] || "";
   if (email) {
-    return `email:${email}`;
+    pushKey(`email:${email}`);
   }
 
   const profileUrl = String(collectContextProfileUrls(context)[0] || "")
     .trim()
     .toLowerCase();
   if (!profileUrl) {
-    return "";
+    return keys;
   }
   try {
     const parsed = new URL(profileUrl);
     parsed.search = "";
     parsed.hash = "";
-    return `profile:${parsed.toString().replace(/\/$/, "")}`;
+    pushKey(`profile:${parsed.toString().replace(/\/$/, "")}`);
   } catch (_error) {
-    return `profile:${profileUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`;
+    pushKey(`profile:${profileUrl.replace(/[?#].*$/, "").replace(/\/$/, "")}`);
   }
+  return keys;
 }
 
 function isCustomFieldCacheFresh(entry) {
@@ -602,33 +653,39 @@ async function setCustomFieldCacheStore(store) {
 }
 
 async function getCachedCustomFieldsForContext(context) {
-  const key = getCustomFieldCacheKey(context);
-  if (!key) {
+  const keys = getCustomFieldCacheKeys(context);
+  if (keys.length === 0) {
     return { key: "", entry: null, isFresh: false };
   }
   const store = await getCustomFieldCacheStore();
-  if (!store[key]) {
-    return { key, entry: null, isFresh: false };
+  for (const key of keys) {
+    if (!store[key]) {
+      continue;
+    }
+    const entry = normalizeCustomFieldCacheEntry(store[key]);
+    return {
+      key,
+      entry,
+      isFresh: isCustomFieldCacheFresh(entry)
+    };
   }
-  const entry = normalizeCustomFieldCacheEntry(store[key]);
-  return {
-    key,
-    entry,
-    isFresh: isCustomFieldCacheFresh(entry)
-  };
+  return { key: keys[0] || "", entry: null, isFresh: false };
 }
 
 async function setCachedCustomFieldsForContext(context, candidateId, customFields) {
-  const key = getCustomFieldCacheKey(context);
-  if (!key) {
+  const keys = getCustomFieldCacheKeys(context, candidateId);
+  if (keys.length === 0) {
     return;
   }
   const store = await getCustomFieldCacheStore();
-  store[key] = {
+  const nextEntry = {
     fetchedAt: Date.now(),
     candidateId: String(candidateId || ""),
     customFields: Array.isArray(customFields) ? customFields : []
   };
+  keys.forEach((key) => {
+    store[key] = nextEntry;
+  });
 
   const pruned = Object.entries(store)
     .sort((a, b) => (Number(b[1]?.fetchedAt) || 0) - (Number(a[1]?.fetchedAt) || 0))
@@ -639,6 +696,102 @@ async function setCachedCustomFieldsForContext(context, candidateId, customField
     }, {});
 
   await setCustomFieldCacheStore(pruned);
+}
+
+function normalizeCustomFieldSelectionLabels(selection, field = null) {
+  const explicitLabels = Array.isArray(selection?.customFieldValueLabels)
+    ? selection.customFieldValueLabels.map((label) => String(label || "").trim()).filter(Boolean)
+    : [];
+  if (explicitLabels.length > 0) {
+    return explicitLabels;
+  }
+
+  const optionIds = Array.isArray(selection?.customFieldOptionIds)
+    ? selection.customFieldOptionIds.map((id) => String(id || "").trim()).filter(Boolean)
+    : [];
+  if (field && optionIds.length > 0) {
+    const optionValueById = new Map(
+      (Array.isArray(field.options) ? field.options : []).map((option) => [String(option.id || "").trim(), String(option.value || "").trim()])
+    );
+    const labelsFromOptions = optionIds.map((id) => optionValueById.get(id) || "").filter(Boolean);
+    if (labelsFromOptions.length > 0) {
+      return labelsFromOptions;
+    }
+  }
+
+  const rawValue = selection?.customFieldValue;
+  if (rawValue === undefined || rawValue === null) {
+    return [];
+  }
+  const trimmedValue = String(rawValue || "").trim();
+  return trimmedValue ? [trimmedValue] : [];
+}
+
+function applyCustomFieldSelectionToCachedFields(customFields, selection) {
+  const normalizedFields = Array.isArray(customFields) ? customFields.slice() : [];
+  const selectionFieldId = String(selection?.customFieldId || "").trim();
+  if (!selectionFieldId) {
+    return { matched: false, customFields: normalizedFields };
+  }
+
+  let matched = false;
+  const nextFields = normalizedFields.map((field) => {
+    if (String(field?.id || "").trim() !== selectionFieldId) {
+      return field;
+    }
+    matched = true;
+    const valueType = String(selection?.customFieldValueType || field?.valueType || "").trim().toLowerCase();
+    const optionIds = Array.isArray(selection?.customFieldOptionIds)
+      ? Array.from(
+          new Set(selection.customFieldOptionIds.map((id) => String(id || "").trim()).filter(Boolean))
+        )
+      : [];
+    const labels = normalizeCustomFieldSelectionLabels(selection, field);
+
+    if (valueType === "multi_select") {
+      return {
+        ...field,
+        currentOptionIds: optionIds,
+        currentValueLabels: labels
+      };
+    }
+
+    if (valueType === "single_select") {
+      return {
+        ...field,
+        currentOptionIds: optionIds.slice(0, 1),
+        currentValueLabels: labels.slice(0, 1)
+      };
+    }
+
+    return {
+      ...field,
+      currentOptionIds: [],
+      currentValueLabels: labels.slice(0, 1)
+    };
+  });
+
+  return {
+    matched,
+    customFields: nextFields
+  };
+}
+
+async function patchCachedCustomFieldSelectionForContext(context, candidateId, selection) {
+  const cached = await getCachedCustomFieldsForContext(context);
+  if (!cached.entry) {
+    return false;
+  }
+  const patched = applyCustomFieldSelectionToCachedFields(cached.entry.customFields, selection);
+  if (!patched.matched) {
+    return false;
+  }
+  await setCachedCustomFieldsForContext(
+    context,
+    String(candidateId || cached.entry.candidateId || "").trim(),
+    patched.customFields
+  );
+  return true;
 }
 
 function isCandidateEmailCacheFresh(entry) {
@@ -1208,6 +1361,76 @@ function getContextLink(context = {}) {
   );
 }
 
+function pruneCandidateResolutionCache() {
+  while (candidateResolutionCache.size > CANDIDATE_RESOLUTION_CACHE_LIMIT) {
+    const oldestKey = candidateResolutionCache.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    candidateResolutionCache.delete(oldestKey);
+  }
+}
+
+function getCandidateResolutionCacheKey(context = {}) {
+  return getCandidateResolutionCacheKeys(context)[0] || "";
+}
+
+function getCandidateResolutionCacheKeys(context = {}, candidate = null) {
+  const candidateId = String(candidate?.id || context?.gemCandidateId || "").trim();
+  return getCustomFieldCacheKeys(context, candidateId);
+}
+
+function getCachedCandidateResolution(context = {}) {
+  const keys = getCandidateResolutionCacheKeys(context);
+  if (keys.length === 0) {
+    return { key: "", hasValue: false, candidate: null };
+  }
+  for (const key of keys) {
+    const entry = candidateResolutionCache.get(key);
+    if (!entry) {
+      continue;
+    }
+    const ttlMs = entry.hasCandidate ? CANDIDATE_RESOLUTION_TTL_MS : CANDIDATE_RESOLUTION_NEGATIVE_TTL_MS;
+    if (Date.now() - Number(entry.fetchedAt || 0) > ttlMs) {
+      candidateResolutionCache.delete(key);
+      continue;
+    }
+    candidateResolutionCache.delete(key);
+    candidateResolutionCache.set(key, entry);
+    return {
+      key,
+      hasValue: true,
+      candidate: entry.hasCandidate ? entry.candidate : null
+    };
+  }
+  return { key: keys[0] || "", hasValue: false, candidate: null };
+}
+
+function rememberCandidateResolution(context = {}, candidate = null) {
+  const keys = getCandidateResolutionCacheKeys(context, candidate);
+  if (keys.length === 0) {
+    return;
+  }
+  const entry = {
+    fetchedAt: Date.now(),
+    hasCandidate: Boolean(candidate?.id),
+    candidate: candidate?.id ? candidate : null
+  };
+  keys.forEach((key) => {
+    candidateResolutionCache.delete(key);
+    candidateResolutionCache.set(key, entry);
+  });
+  pruneCandidateResolutionCache();
+}
+
+function clearCandidateResolution(context = {}) {
+  const keys = getCandidateResolutionCacheKeys(context);
+  if (keys.length === 0) {
+    return;
+  }
+  keys.forEach((key) => candidateResolutionCache.delete(key));
+}
+
 function contextHasCandidateIdentity(context = {}) {
   return Boolean(
     String(context.gemCandidateId || "").trim() ||
@@ -1263,6 +1486,15 @@ function extractLinkedInIdentityFromCandidate(candidate) {
 }
 
 async function findCandidateByContext(settings, context, audit) {
+  if (!audit?.forceFreshLookup) {
+    const cachedResolution = getCachedCandidateResolution(context);
+    if (cachedResolution.hasValue) {
+      return cachedResolution.candidate;
+    }
+  } else {
+    clearCandidateResolution(context);
+  }
+
   const gemCandidateId = String(context?.gemCandidateId || "").trim();
   if (gemCandidateId) {
     try {
@@ -1273,6 +1505,7 @@ async function findCandidateByContext(settings, context, audit) {
         { ...audit, step: "findCandidateById" }
       );
       if (byId?.candidate?.id) {
+        rememberCandidateResolution(context, byId.candidate);
         return byId.candidate;
       }
     } catch (_error) {
@@ -1293,6 +1526,7 @@ async function findCandidateByContext(settings, context, audit) {
       { ...audit, step: "findCandidateByLinkedIn" }
     );
     if (byLinkedIn?.candidate?.id) {
+      rememberCandidateResolution(context, byLinkedIn.candidate);
       return byLinkedIn.candidate;
     }
   }
@@ -1306,6 +1540,7 @@ async function findCandidateByContext(settings, context, audit) {
       { ...audit, step: "findCandidateByEmail" }
     );
     if (byEmail?.candidate?.id) {
+      rememberCandidateResolution(context, byEmail.candidate);
       return byEmail.candidate;
     }
   }
@@ -1319,10 +1554,12 @@ async function findCandidateByContext(settings, context, audit) {
       { ...audit, step: "findCandidateByProfileUrl" }
     );
     if (byProfileUrl?.candidate?.id) {
+      rememberCandidateResolution(context, byProfileUrl.candidate);
       return byProfileUrl.candidate;
     }
   }
 
+  rememberCandidateResolution(context, null);
   return null;
 }
 
@@ -1486,8 +1723,12 @@ async function sendClientLogToBackend(settings, entry) {
 
 function logEvent(settings, rawEvent) {
   const entry = normalizeLogEntry(rawEvent);
-  appendLocalLog(entry).catch(() => {});
-  if (settings?.backendBaseUrl) {
+  const shouldPersistLocally = entry.level === "warn" || entry.level === "error";
+  const shouldSendRemotely = entry.level === "error" && settings?.backendBaseUrl;
+  if (shouldPersistLocally) {
+    appendLocalLog(entry).catch(() => {});
+  }
+  if (shouldSendRemotely) {
     sendClientLogToBackend(settings, entry).catch(() => {});
   }
   return entry;
@@ -1709,6 +1950,44 @@ async function openGemNavigationTarget(url, meta = {}, options = {}) {
   };
 }
 
+function pingTabContentRuntime(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { type: "CONTENT_RUNTIME_PING" }, (response) => {
+      if (chrome.runtime.lastError) {
+        resolve(false);
+        return;
+      }
+      resolve(Boolean(response?.ok));
+    });
+  });
+}
+
+async function ensureContentRuntimeInTab(tabId, files = CONTENT_RUNTIME_FILES) {
+  if (!Number.isInteger(tabId) || tabId < 0) {
+    throw new Error("No active tab available for runtime injection.");
+  }
+  const ready = await pingTabContentRuntime(tabId);
+  if (ready) {
+    return { injected: false };
+  }
+  const sharedProbe = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => Boolean(globalThis.__GLS_SHARED_RUNTIME_READY__)
+  });
+  const sharedReady = Array.isArray(sharedProbe) && sharedProbe[0] ? Boolean(sharedProbe[0].result) : false;
+  if (!sharedReady) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: [SHARED_RUNTIME_FILE]
+    });
+  }
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: Array.isArray(files) && files.length > 0 ? files : CONTENT_RUNTIME_FILES
+  });
+  return { injected: true };
+}
+
 async function callBackend(path, payload, settings, audit = {}) {
   const base = (settings.backendBaseUrl || "").replace(/\/$/, "");
   if (!base) {
@@ -1716,18 +1995,6 @@ async function callBackend(path, payload, settings, audit = {}) {
   }
 
   const startedAt = Date.now();
-  logEvent(settings, {
-    event: "backend.call.start",
-    actionId: audit.actionId,
-    runId: audit.runId,
-    message: `Calling backend route ${path}`,
-    link: `${base}${path}`,
-    details: {
-      step: audit.step || "",
-      payload
-    }
-  });
-
   let response;
   try {
     response = await fetch(`${base}${path}`, {
@@ -1797,19 +2064,6 @@ async function callBackend(path, payload, settings, audit = {}) {
     throw new Error(surfacedError);
   }
 
-  logEvent(settings, {
-    event: "backend.call.success",
-    actionId: audit.actionId,
-    runId: audit.runId,
-    message: `Backend route succeeded: ${path}`,
-    link: `${base}${path}`,
-    durationMs,
-    details: {
-      step: audit.step || "",
-      requestId: parsed.requestId || ""
-    }
-  });
-
   return parsed.data;
 }
 
@@ -1845,7 +2099,8 @@ function formatDateForHumans(rawDate) {
 }
 
 async function ensureCandidate(settings, context, audit, options = {}) {
-  const allowCreate = options.allowCreate !== false;
+  const sourcePlatform = String(context?.sourcePlatform || "").trim().toLowerCase();
+  const allowCreate = options.allowCreate !== false && sourcePlatform !== "gmail";
   const linkedInHandle = String(context.linkedInHandle || "").trim();
   const linkedInUrl = String(context.linkedinUrl || "").trim();
   const gemCandidateId = String(context.gemCandidateId || "").trim();
@@ -1853,6 +2108,7 @@ async function ensureCandidate(settings, context, audit, options = {}) {
 
   const foundCandidate = await findCandidateByContext(settings, context, audit);
   if (foundCandidate?.id) {
+    rememberCandidateResolution(context, foundCandidate);
     logEvent(settings, {
       event: "candidate.found",
       actionId: audit.actionId,
@@ -1870,6 +2126,9 @@ async function ensureCandidate(settings, context, audit, options = {}) {
   }
 
   if (!allowCreate) {
+    if (sourcePlatform === "gmail") {
+      throw new Error("Could not find an existing Gem candidate for this Gmail thread.");
+    }
     throw new Error("Could not find an existing Gem candidate for this context.");
   }
 
@@ -1915,6 +2174,7 @@ async function ensureCandidate(settings, context, audit, options = {}) {
     throw new Error("Gem did not return a candidate id.");
   }
 
+  rememberCandidateResolution(context, created.candidate);
   logEvent(settings, {
     event: "candidate.created",
     actionId: audit.actionId,
@@ -2202,6 +2462,87 @@ async function runAction(actionId, context, settings, meta = {}) {
     return { ok: true, message, runId, link: openUrl };
   }
 
+  if (actionId === ACTIONS.SET_CUSTOM_FIELD) {
+    let candidateId = String(context.gemCandidateId || "").trim();
+    let candidateLink = String(context.gemProfileUrl || "").trim();
+    if (!candidateId) {
+      const candidate = await ensureCandidate(settings, context, audit);
+      candidateId = String(candidate.id || "").trim();
+      candidateLink = String(candidate.weblink || candidateLink || "").trim();
+    }
+    if (!candidateId) {
+      throw new Error("Could not resolve candidate id for custom field update.");
+    }
+
+    const customFieldId = context.customFieldId || settings.customFieldId;
+    const customFieldValue =
+      context.customFieldValue !== undefined && context.customFieldValue !== null
+        ? context.customFieldValue
+        : settings.customFieldValue;
+    const customFieldOptionId = context.customFieldOptionId || "";
+    const customFieldOptionIds = Array.isArray(context.customFieldOptionIds)
+      ? context.customFieldOptionIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
+    const customFieldValueType = context.customFieldValueType || "";
+    if (!customFieldId) {
+      const message = "Missing custom field ID.";
+      logEvent(settings, {
+        level: "warn",
+        event: "action.rejected",
+        actionId,
+        runId,
+        source: `extension.${source}`,
+        message,
+        link: contextLink
+      });
+      return { ok: false, message, runId };
+    }
+
+    await callBackend(
+      "/api/candidates/set-custom-field",
+      {
+        candidateId,
+        customFieldId,
+        value: customFieldValue,
+        customFieldOptionId,
+        customFieldOptionIds,
+        customFieldValueType
+      },
+      settings,
+      { ...audit, step: "setCustomField" }
+    );
+    await patchCachedCustomFieldSelectionForContext(
+      { ...context, gemCandidateId: candidateId },
+      candidateId,
+      {
+        customFieldId,
+        customFieldValue,
+        customFieldValueLabels: Array.isArray(context.customFieldValueLabels)
+          ? context.customFieldValueLabels.slice()
+          : [],
+        customFieldOptionId,
+        customFieldOptionIds,
+        customFieldValueType
+      }
+    ).catch(() => false);
+    notifyLinkedInStatusChanged({ ...context, gemCandidateId: candidateId }, runId);
+    const message = "Custom field updated for candidate.";
+    logEvent(settings, {
+      event: "action.succeeded",
+      actionId,
+      runId,
+      source: `extension.${source}`,
+      message,
+      link: candidateLink || contextLink,
+      details: {
+        candidateId,
+        customFieldId,
+        selectedOptionCount: customFieldOptionIds.length
+      }
+    });
+    return { ok: true, message, runId, link: candidateLink || "", candidateId };
+  }
+
   const candidate = await ensureCandidate(settings, context, audit);
 
   if (actionId === ACTIONS.ADD_TO_PROJECT) {
@@ -2290,62 +2631,6 @@ async function runAction(actionId, context, settings, meta = {}) {
       details: { candidateId: candidate.id }
     });
     return { ok: true, message, runId, link: url };
-  }
-
-  if (actionId === ACTIONS.SET_CUSTOM_FIELD) {
-    const customFieldId = context.customFieldId || settings.customFieldId;
-    const customFieldValue =
-      context.customFieldValue !== undefined && context.customFieldValue !== null
-        ? context.customFieldValue
-        : settings.customFieldValue;
-    const customFieldOptionId = context.customFieldOptionId || "";
-    const customFieldOptionIds = Array.isArray(context.customFieldOptionIds)
-      ? context.customFieldOptionIds.map((id) => String(id || "").trim()).filter(Boolean)
-      : [];
-    const customFieldValueType = context.customFieldValueType || "";
-    if (!customFieldId) {
-      const message = "Missing custom field ID.";
-      logEvent(settings, {
-        level: "warn",
-        event: "action.rejected",
-        actionId,
-        runId,
-        source: `extension.${source}`,
-        message,
-        link: contextLink
-      });
-      return { ok: false, message, runId };
-    }
-
-    await callBackend(
-      "/api/candidates/set-custom-field",
-      {
-        candidateId: candidate.id,
-        customFieldId,
-        value: customFieldValue,
-        customFieldOptionId,
-        customFieldOptionIds,
-        customFieldValueType
-      },
-      settings,
-      { ...audit, step: "setCustomField" }
-    );
-    notifyLinkedInStatusChanged({ ...context, gemCandidateId: candidate.id }, runId);
-    const message = "Custom field updated for candidate.";
-    logEvent(settings, {
-      event: "action.succeeded",
-      actionId,
-      runId,
-      source: `extension.${source}`,
-      message,
-      link: candidate.weblink || contextLink,
-      details: {
-        candidateId: candidate.id,
-        customFieldId,
-        selectedOptionCount: customFieldOptionIds.length
-      }
-    });
-    return { ok: true, message, runId, link: candidate.weblink || "" };
   }
 
   if (actionId === ACTIONS.ADD_NOTE_TO_CANDIDATE) {
@@ -2568,7 +2853,9 @@ async function runAction(actionId, context, settings, meta = {}) {
 async function refreshCustomFieldsForContext(settings, context, runId, options = {}) {
   const allowCreate = options.allowCreate !== false;
   if (!allowCreate) {
-    const prefetched = await prefetchCustomFieldsForContext(settings, context, runId);
+    const prefetched = await prefetchCustomFieldsForContext(settings, context, runId, {
+      forceFreshLookup: Boolean(options.forceRefresh)
+    });
     return {
       candidateId: prefetched.candidateId,
       customFields: prefetched.customFields,
@@ -2608,10 +2895,19 @@ async function refreshCustomFieldsForContext(settings, context, runId, options =
   };
 }
 
-async function prefetchCustomFieldsForContext(settings, context, runId) {
+async function prefetchCustomFieldsForContext(settings, context, runId, options = {}) {
   const actionId = ACTIONS.SET_CUSTOM_FIELD;
   const audit = { actionId, runId };
-  const candidateId = await findExistingCandidateIdForContext(settings, context, runId, actionId);
+  const candidateId = await findExistingCandidateIdForContext(settings, context, runId, actionId, {
+    forceFreshLookup: Boolean(options.forceFreshLookup)
+  });
+  if (!candidateId) {
+    await setCachedCustomFieldsForContext(context, "", []);
+    return {
+      candidateId: "",
+      customFields: []
+    };
+  }
 
   const data = await callBackend(
     "/api/custom-fields/list",
@@ -2649,7 +2945,10 @@ function ensureCustomFieldRefresh(settings, context, runId, options = {}) {
   if (existing) {
     return existing;
   }
-  const promise = refreshCustomFieldsForContext(settings, context, runId, { allowCreate }).finally(() => {
+  const promise = refreshCustomFieldsForContext(settings, context, runId, {
+    allowCreate,
+    forceRefresh: Boolean(options.forceRefresh)
+  }).finally(() => {
     customFieldRefreshPromises.delete(key);
   });
   customFieldRefreshPromises.set(key, promise);
@@ -2657,39 +2956,40 @@ function ensureCustomFieldRefresh(settings, context, runId, options = {}) {
 }
 
 async function listCustomFieldsForContext(settings, context, runId, options = {}) {
-  const preferCache = Boolean(options.preferCache);
-  const refreshInBackground = Boolean(options.refreshInBackground);
   const forceRefresh = Boolean(options.forceRefresh);
   const allowCreate = options.allowCreate !== false;
   const actionId = ACTIONS.SET_CUSTOM_FIELD;
 
   const cached = await getCachedCustomFieldsForContext(context);
-  if (!forceRefresh && cached.entry) {
-    if (preferCache || cached.isFresh) {
-      if (!cached.isFresh && refreshInBackground) {
-        ensureCustomFieldRefresh(settings, context, runId, { allowCreate }).catch(() => {});
-      }
-      logEvent(settings, {
-        event: "custom_fields.list.loaded",
-        actionId,
-        runId,
-        message: `Loaded ${cached.entry.customFields.length} custom fields from cache.`,
-        details: {
-          candidateId: cached.entry.candidateId,
-          stale: !cached.isFresh,
-          allowCreate
-        }
-      });
-      return {
-        candidateId: cached.entry.candidateId,
-        customFields: cached.entry.customFields,
-        fromCache: true,
-        stale: !cached.isFresh
-      };
+  const cachedCandidateId = String(cached.entry?.candidateId || "").trim();
+  const hasUsableCachedEntry = Boolean(cached.entry && cachedCandidateId);
+  if (!forceRefresh && hasUsableCachedEntry) {
+    if (!cached.isFresh) {
+      ensureCustomFieldRefresh(settings, context, runId, { allowCreate }).catch(() => {});
     }
+    logEvent(settings, {
+      event: "custom_fields.list.loaded",
+      actionId,
+      runId,
+      message: `Loaded ${cached.entry.customFields.length} custom fields from cache.`,
+      details: {
+        candidateId: cached.entry.candidateId,
+        stale: !cached.isFresh,
+        allowCreate
+      }
+    });
+    return {
+      candidateId: cachedCandidateId,
+      customFields: cached.entry.customFields,
+      fromCache: true,
+      stale: !cached.isFresh
+    };
   }
 
-  const refreshed = await ensureCustomFieldRefresh(settings, context, runId, { allowCreate });
+  const refreshed = await ensureCustomFieldRefresh(settings, context, runId, {
+    allowCreate,
+    forceRefresh: forceRefresh || Boolean(cached.entry && !cachedCandidateId)
+  });
   logEvent(settings, {
     event: "custom_fields.list.loaded",
     actionId,
@@ -2704,12 +3004,16 @@ async function listCustomFieldsForContext(settings, context, runId, options = {}
   return refreshed;
 }
 
-async function findExistingCandidateIdForContext(settings, context, runId, actionId) {
+async function findExistingCandidateIdForContext(settings, context, runId, actionId, options = {}) {
   const existing = await findCandidateByContext(settings, context, {
     actionId,
     runId,
-    step: "findExistingCandidateForContext"
+    step: "findExistingCandidateForContext",
+    forceFreshLookup: Boolean(options.forceFreshLookup)
   });
+  if (existing?.id) {
+    rememberCandidateResolution(context, existing);
+  }
   return String(existing?.id || "").trim();
 }
 
@@ -2774,36 +3078,32 @@ function ensureCandidateEmailRefresh(settings, context, runId, options = {}) {
 
 async function listCandidateEmailsForContext(settings, context, runId, options = {}) {
   const actionId = ACTIONS.MANAGE_EMAILS;
-  const preferCache = Boolean(options.preferCache);
-  const refreshInBackground = Boolean(options.refreshInBackground);
   const forceRefresh = Boolean(options.forceRefresh);
   const allowCreate = options.allowCreate !== false;
 
   const cached = await getCachedCandidateEmailsForContext(context);
   if (!forceRefresh && cached.entry) {
-    if (preferCache || cached.isFresh) {
-      if (!cached.isFresh && refreshInBackground) {
-        ensureCandidateEmailRefresh(settings, context, runId, { allowCreate }).catch(() => {});
-      }
-      logEvent(settings, {
-        event: "candidate.emails.loaded",
-        actionId,
-        runId,
-        message: `Loaded ${cached.entry.emails.length} candidate email${cached.entry.emails.length === 1 ? "" : "s"} from cache.`,
-        details: {
-          candidateId: cached.entry.candidateId,
-          stale: !cached.isFresh,
-          allowCreate
-        }
-      });
-      return {
-        candidateId: cached.entry.candidateId,
-        emails: cached.entry.emails,
-        primaryEmail: cached.entry.primaryEmail,
-        fromCache: true,
-        stale: !cached.isFresh
-      };
+    if (!cached.isFresh) {
+      ensureCandidateEmailRefresh(settings, context, runId, { allowCreate }).catch(() => {});
     }
+    logEvent(settings, {
+      event: "candidate.emails.loaded",
+      actionId,
+      runId,
+      message: `Loaded ${cached.entry.emails.length} candidate email${cached.entry.emails.length === 1 ? "" : "s"} from cache.`,
+      details: {
+        candidateId: cached.entry.candidateId,
+        stale: !cached.isFresh,
+        allowCreate
+      }
+    });
+    return {
+      candidateId: cached.entry.candidateId,
+      emails: cached.entry.emails,
+      primaryEmail: cached.entry.primaryEmail,
+      fromCache: true,
+      stale: !cached.isFresh
+    };
   }
 
   const refreshed = await ensureCandidateEmailRefresh(settings, context, runId, { allowCreate });
@@ -2991,6 +3291,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         });
         sendResponse({ ok: true, settings: updated });
+      })
+      .catch((error) => sendResponse({ ok: false, message: error.message }));
+    return true;
+  }
+
+  if (message.type === "ENSURE_CONTENT_RUNTIME") {
+    Promise.resolve()
+      .then(async () => {
+        const requestedTabId = Number(message.tabId);
+        const senderTabId = Number(sender?.tab?.id);
+        const tabId = Number.isInteger(requestedTabId) && requestedTabId >= 0
+          ? requestedTabId
+          : Number.isInteger(senderTabId) && senderTabId >= 0
+            ? senderTabId
+            : -1;
+        const files = Array.isArray(message.files) && message.files.length > 0 ? message.files : CONTENT_RUNTIME_FILES;
+        const result = await ensureContentRuntimeInTab(tabId, files);
+        sendResponse({ ok: true, injected: Boolean(result.injected) });
       })
       .catch((error) => sendResponse({ ok: false, message: error.message }));
     return true;
@@ -3459,64 +3777,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "PREFETCH_CUSTOM_FIELDS_FOR_CONTEXT") {
-    getSettings()
-      .then(async (settings) => {
-        const runId = message.runId || generateId();
-        const context = message.context || {};
-        if (!contextHasCandidateIdentity(context)) {
-          sendResponse({ ok: true, skipped: true, reason: "missing_context" });
-          return;
-        }
-
-        const cached = await getCachedCustomFieldsForContext(context);
-        if (cached.entry && cached.isFresh) {
-          sendResponse({ ok: true, skipped: true, reason: "cache_fresh" });
-          return;
-        }
-
-        await prefetchCustomFieldsForContext(settings, context, runId);
-        sendResponse({ ok: true, skipped: false });
-      })
-      .catch((error) => sendResponse({ ok: false, message: error.message }));
-    return true;
+    sendResponse({ ok: true, skipped: true, reason: "passive_prefetch_disabled" });
+    return false;
   }
 
   if (message.type === "PREFETCH_PROJECTS") {
-    getSettings()
-      .then(async (settings) => {
-        const runId = message.runId || generateId();
-        const limit = normalizeProjectLimit(message.limit);
-        const forceRefresh = Boolean(message.forceRefresh);
-        const forceNewRefresh = Boolean(message.forceNewRefresh);
-        const cache = await getProjectCache();
-        if (!forceRefresh && cache.projects.length > 0 && isProjectCacheFresh(cache) && cache.isComplete) {
-          sendResponse({ ok: true, skipped: true, reason: "cache_fresh" });
-          return;
-        }
-        await ensureProjectRefresh(settings, runId, limit, { forceNew: forceNewRefresh });
-        sendResponse({ ok: true, skipped: false, forced: forceRefresh, forceNewRefresh });
-      })
-      .catch((error) => sendResponse({ ok: false, message: error.message }));
-    return true;
+    sendResponse({ ok: true, skipped: true, reason: "passive_prefetch_disabled" });
+    return false;
   }
 
   if (message.type === "PREFETCH_SEQUENCES") {
-    getSettings()
-      .then(async (settings) => {
-        const runId = message.runId || generateId();
-        const limit = normalizeSequenceLimit(message.limit);
-        const forceRefresh = Boolean(message.forceRefresh);
-        const forceNewRefresh = Boolean(message.forceNewRefresh);
-        const cache = await getSequenceCache();
-        if (!forceRefresh && cache.sequences.length > 0 && isSequenceCacheFresh(cache) && cache.isComplete) {
-          sendResponse({ ok: true, skipped: true, reason: "cache_fresh" });
-          return;
-        }
-        await ensureSequenceRefresh(settings, runId, limit, ACTIONS.SEND_SEQUENCE, { forceNew: forceNewRefresh });
-        sendResponse({ ok: true, skipped: false, forced: forceRefresh, forceNewRefresh });
-      })
-      .catch((error) => sendResponse({ ok: false, message: error.message }));
-    return true;
+    sendResponse({ ok: true, skipped: true, reason: "passive_prefetch_disabled" });
+    return false;
   }
 
   if (message.type === "LOG_EVENT") {
@@ -3561,6 +3833,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.runtime.onInstalled.addListener((details) => {
   const reason = details?.reason ? `onInstalled:${details.reason}` : "onInstalled";
   ensureOrgDefaultsBootstrapped(reason).catch(() => {});
+});
+
+chrome.storage.onChanged.addListener((changes, namespace) => {
+  if (namespace === "sync" && Object.prototype.hasOwnProperty.call(changes || {}, "settings")) {
+    invalidateSettingsCache();
+  }
+  if (namespace === "local" && Object.prototype.hasOwnProperty.call(changes || {}, LOCAL_LOG_KEY)) {
+    localLogsCache = Array.isArray(changes[LOCAL_LOG_KEY]?.newValue) ? changes[LOCAL_LOG_KEY].newValue.slice() : [];
+  }
 });
 
 chrome.runtime.onStartup.addListener(() => {

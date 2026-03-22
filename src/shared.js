@@ -1,5 +1,7 @@
 "use strict";
 
+globalThis.__GLS_SHARED_RUNTIME_READY__ = true;
+
 const ACTIONS = {
   GEM_ACTIONS: "gemActions",
   ADD_PROSPECT: "addProspect",
@@ -38,7 +40,6 @@ const ALLOWED_BACKEND_ORIGINS = Object.freeze([
 ]);
 
 const GEM_STATUS_DISPLAY_MODES = Object.freeze({
-  FRAME_AND_STATUS: "frameAndStatus",
   STATUS_ONLY: "statusOnly",
   OFF: "off"
 });
@@ -46,7 +47,7 @@ const GEM_STATUS_DISPLAY_MODES = Object.freeze({
 const DEFAULT_SETTINGS = {
   enabled: true,
   showGemStatusBadge: true,
-  gemStatusDisplayMode: GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS,
+  gemStatusDisplayMode: GEM_STATUS_DISPLAY_MODES.STATUS_ONLY,
   backendBaseUrl: "http://localhost:8787",
   backendSharedToken: "",
   createdByUserId: "",
@@ -87,10 +88,7 @@ const DEFAULT_SETTINGS = {
 
 function normalizeGemStatusDisplayMode(rawValue, fallbackEnabled = true) {
   const value = String(rawValue || "").trim();
-  if (value === GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS) {
-    return GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS;
-  }
-  if (value === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY) {
+  if (value === "frameAndStatus" || value === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY) {
     return GEM_STATUS_DISPLAY_MODES.STATUS_ONLY;
   }
   if (value === GEM_STATUS_DISPLAY_MODES.OFF) {
@@ -99,35 +97,25 @@ function normalizeGemStatusDisplayMode(rawValue, fallbackEnabled = true) {
   if (rawValue === false) {
     return GEM_STATUS_DISPLAY_MODES.OFF;
   }
-  return fallbackEnabled ? GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS : GEM_STATUS_DISPLAY_MODES.OFF;
+  return fallbackEnabled ? GEM_STATUS_DISPLAY_MODES.STATUS_ONLY : GEM_STATUS_DISPLAY_MODES.OFF;
 }
 
 function isGemStatusDisplayEnabled(mode, fallbackEnabled = true) {
   return normalizeGemStatusDisplayMode(mode, fallbackEnabled) !== GEM_STATUS_DISPLAY_MODES.OFF;
 }
 
-function gemStatusDisplayUsesFrame(mode, fallbackEnabled = true) {
-  return normalizeGemStatusDisplayMode(mode, fallbackEnabled) === GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS;
-}
-
 function cycleGemStatusDisplayMode(mode, fallbackEnabled = true) {
   const normalized = normalizeGemStatusDisplayMode(mode, fallbackEnabled);
-  if (normalized === GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS) {
-    return GEM_STATUS_DISPLAY_MODES.STATUS_ONLY;
-  }
   if (normalized === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY) {
     return GEM_STATUS_DISPLAY_MODES.OFF;
   }
-  return GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS;
+  return GEM_STATUS_DISPLAY_MODES.STATUS_ONLY;
 }
 
 function formatGemStatusDisplayModeLabel(mode, fallbackEnabled = true) {
   const normalized = normalizeGemStatusDisplayMode(mode, fallbackEnabled);
-  if (normalized === GEM_STATUS_DISPLAY_MODES.FRAME_AND_STATUS) {
-    return "Liquid glass frame + status";
-  }
   if (normalized === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY) {
-    return "Status only";
+    return "Status banner";
   }
   return "Off";
 }

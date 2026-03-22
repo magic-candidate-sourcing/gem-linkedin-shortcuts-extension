@@ -4,11 +4,13 @@ const enabledCheckbox = document.getElementById("enabled");
 const gemStatusDisplayModeSelect = document.getElementById("gemStatusDisplayMode");
 const statusEl = document.getElementById("status");
 const optionsBtn = document.getElementById("open-options");
-const CONTENT_SCRIPT_FILES = ["src/shared.js", "src/content.js"];
+const LINKEDIN_BOOTSTRAP_FILES = ["src/content_bootstrap.js"];
+const FULL_RUNTIME_FILES = ["src/content.js"];
 const SUPPORTED_TAB_PATTERNS = [
   /^https:\/\/www\.linkedin\.com\/(?:in|pub)\//i,
   /^https:\/\/www\.linkedin\.com\/talent(?:\/[^/]+)?\/profile\//i,
   /^https:\/\/(?:www|app)\.gem\.com\/(?:candidate|projects)\//i,
+  /^https:\/\/mail\.google\.com\/mail\//i,
   /^https:\/\/github\.com\//i
 ];
 
@@ -29,12 +31,20 @@ function isRecoverableContentError(message) {
 }
 
 function getUnsupportedTabMessage() {
-  return "Open a LinkedIn, Gem candidate, Gem project, or GitHub profile tab and retry. If that tab is already supported, refresh it after the extension update.";
+  return "Open a LinkedIn, Gem candidate, Gem project, GitHub profile, or Gmail thread tab and retry. If that tab is already supported, refresh it after the extension update.";
 }
 
 function isSupportedTabUrl(url) {
   const value = String(url || "").trim();
   return SUPPORTED_TAB_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function isLinkedInTabUrl(url) {
+  const value = String(url || "").trim();
+  return (
+    /^https:\/\/www\.linkedin\.com\/(?:in|pub)\//i.test(value) ||
+    /^https:\/\/www\.linkedin\.com\/talent(?:\/[^/]+)?\/profile\//i.test(value)
+  );
 }
 
 function sendRuntimeMessage(payload) {
@@ -70,10 +80,14 @@ function pingContent(tabId) {
   return sendTabMessage(tabId, { type: "PING" });
 }
 
-function injectContentScripts(tabId) {
+function getContentScriptFilesForTab(tab) {
+  return isLinkedInTabUrl(tab?.url || "") ? LINKEDIN_BOOTSTRAP_FILES : FULL_RUNTIME_FILES;
+}
+
+function injectContentScripts(tabId, tab) {
   return chrome.scripting.executeScript({
     target: { tabId },
-    files: CONTENT_SCRIPT_FILES
+    files: getContentScriptFilesForTab(tab)
   });
 }
 
@@ -100,7 +114,7 @@ async function ensureContentScriptReady(tab) {
   }
 
   try {
-    await injectContentScripts(tabId);
+    await injectContentScripts(tabId, tab);
   } catch (_error) {
     throw new Error(getUnsupportedTabMessage());
   }
@@ -111,9 +125,14 @@ async function ensureContentScriptReady(tab) {
   }
 }
 
-function sendActionToContent(tabId, actionId) {
+async function sendActionToContent(tabId, actionId) {
   const runId = generateRunId();
-  return sendTabMessage(tabId, { type: "TRIGGER_ACTION", actionId, source: "popup", runId });
+  let response = await sendTabMessage(tabId, { type: "TRIGGER_ACTION", actionId, source: "popup", runId });
+  if (response?.deferred) {
+    await new Promise((resolve) => window.setTimeout(resolve, 40));
+    response = await sendTabMessage(tabId, { type: "TRIGGER_ACTION", actionId, source: "popup", runId });
+  }
+  return response;
 }
 
 async function syncSettingsToActiveTab(settings) {
