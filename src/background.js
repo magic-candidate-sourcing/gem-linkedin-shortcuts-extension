@@ -1538,16 +1538,32 @@ function extractLinkedInIdentityFromCandidate(candidate) {
   };
 }
 
-async function findCandidateByContext(settings, context, audit) {
-  if (!audit?.forceFreshLookup) {
-    const cachedResolution = getCachedCandidateResolution(context);
-    if (cachedResolution.hasValue) {
-      return cachedResolution.candidate;
-    }
-  } else {
-    clearCandidateResolution(context);
-  }
+function buildCandidateResolutionPayload(context = {}) {
+  return {
+    candidateId: String(context?.gemCandidateId || "").trim(),
+    linkedInHandle: String(context?.linkedInHandle || "").trim(),
+    linkedInUrl: String(context?.linkedinUrl || "").trim(),
+    emails: collectContextEmails(context),
+    profileUrls: collectContextProfileUrls(context)
+  };
+}
 
+function candidateResolutionPayloadHasLookupValue(payload = {}) {
+  return Boolean(
+    String(payload?.candidateId || "").trim() ||
+      String(payload?.linkedInHandle || "").trim() ||
+      String(payload?.linkedInUrl || "").trim() ||
+      (Array.isArray(payload?.emails) && payload.emails.length > 0) ||
+      (Array.isArray(payload?.profileUrls) && payload.profileUrls.length > 0)
+  );
+}
+
+function shouldFallbackToLegacyCandidateResolution(error) {
+  const message = String(error?.message || "");
+  return /unknown route/i.test(message) || /not found/i.test(message);
+}
+
+async function findCandidateByContextLegacy(settings, context, audit) {
   const gemCandidateId = String(context?.gemCandidateId || "").trim();
   if (gemCandidateId) {
     try {
@@ -1558,7 +1574,6 @@ async function findCandidateByContext(settings, context, audit) {
         { ...audit, step: "findCandidateById" }
       );
       if (byId?.candidate?.id) {
-        rememberCandidateResolution(context, byId.candidate);
         return byId.candidate;
       }
     } catch (_error) {
@@ -1579,7 +1594,6 @@ async function findCandidateByContext(settings, context, audit) {
       { ...audit, step: "findCandidateByLinkedIn" }
     );
     if (byLinkedIn?.candidate?.id) {
-      rememberCandidateResolution(context, byLinkedIn.candidate);
       return byLinkedIn.candidate;
     }
   }
@@ -1593,7 +1607,6 @@ async function findCandidateByContext(settings, context, audit) {
       { ...audit, step: "findCandidateByEmail" }
     );
     if (byEmail?.candidate?.id) {
-      rememberCandidateResolution(context, byEmail.candidate);
       return byEmail.candidate;
     }
   }
@@ -1607,13 +1620,61 @@ async function findCandidateByContext(settings, context, audit) {
       { ...audit, step: "findCandidateByProfileUrl" }
     );
     if (byProfileUrl?.candidate?.id) {
-      rememberCandidateResolution(context, byProfileUrl.candidate);
       return byProfileUrl.candidate;
     }
   }
 
-  rememberCandidateResolution(context, null);
   return null;
+}
+
+async function findCandidateByContext(settings, context, audit) {
+  if (!audit?.forceFreshLookup) {
+    const cachedResolution = getCachedCandidateResolution(context);
+    if (cachedResolution.hasValue) {
+      return cachedResolution.candidate;
+    }
+  } else {
+    clearCandidateResolution(context);
+  }
+
+  if (typeof enrichGmailContext === "function") {
+    await enrichGmailContext(settings, context, audit);
+  }
+
+  if (!audit?.forceFreshLookup) {
+    const cachedResolution = getCachedCandidateResolution(context);
+    if (cachedResolution.hasValue) {
+      return cachedResolution.candidate;
+    }
+  }
+
+  const payload = buildCandidateResolutionPayload(context);
+  if (!candidateResolutionPayloadHasLookupValue(payload)) {
+    rememberCandidateResolution(context, null);
+    return null;
+  }
+
+  try {
+    const resolved = await callBackend(
+      "/api/candidates/resolve-context",
+      payload,
+      settings,
+      { ...audit, step: "resolveCandidateByContext" }
+    );
+    const candidate = resolved?.candidate?.id ? resolved.candidate : null;
+    rememberCandidateResolution(context, candidate);
+    return candidate;
+  } catch (error) {
+    if (!shouldFallbackToLegacyCandidateResolution(error)) {
+      throw error;
+    }
+    const candidate = await findCandidateByContextLegacy(settings, context, {
+      ...audit,
+      step: "resolveCandidateByContextLegacy"
+    });
+    rememberCandidateResolution(context, candidate);
+    return candidate;
+  }
 }
 
 async function refreshSequencesFromBackend(settings, runId, limit = SEQUENCE_CACHE_LIMIT, actionId = ACTIONS.SEND_SEQUENCE) {

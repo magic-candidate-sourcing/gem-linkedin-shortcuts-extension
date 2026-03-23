@@ -1101,6 +1101,121 @@ async function findCandidateByProfileUrl(payload, audit) {
   return { candidate: candidate && candidate.id ? candidate : null };
 }
 
+function normalizeCandidateResolutionStrings(values, normalize = (value) => String(value || "").trim()) {
+  const out = [];
+  const seen = new Set();
+  for (const value of Array.isArray(values) ? values : []) {
+    const normalized = normalize(value);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function collectCandidateResolutionEmails(payload = {}) {
+  return normalizeCandidateResolutionStrings(
+    [
+      payload.email,
+      payload.emailAddress,
+      payload.contactEmail,
+      ...(Array.isArray(payload.emails) ? payload.emails : []),
+      ...(Array.isArray(payload.contactEmails) ? payload.contactEmails : [])
+    ],
+    (value) => normalizeUserEmail(value)
+  );
+}
+
+function collectCandidateResolutionProfileUrls(payload = {}) {
+  return normalizeCandidateResolutionStrings(
+    [
+      payload.profileUrl,
+      payload.url,
+      payload.githubUrl,
+      payload.linkedInUrl,
+      payload.linkedinUrl,
+      ...(Array.isArray(payload.profileUrls) ? payload.profileUrls : [])
+    ],
+    (value) => normalizeProfileUrl(value)
+  );
+}
+
+async function resolveCandidateByContext(payload, audit) {
+  const candidateId = String(payload?.candidateId || payload?.gemCandidateId || "").trim();
+  const linkedInHandle = sanitizeLinkedInHandle(payload?.linkedInHandle || payload?.linkedinHandle);
+  const linkedInUrl = firstNonEmpty(payload?.linkedInUrl, payload?.linkedinUrl);
+  const emails = collectCandidateResolutionEmails(payload);
+  const profileUrls = collectCandidateResolutionProfileUrls(payload);
+
+  if (!candidateId && !linkedInHandle && !linkedInUrl && emails.length === 0 && profileUrls.length === 0) {
+    throw new Error("candidateId, linkedInHandle, linkedInUrl, emails, or profileUrls is required.");
+  }
+
+  if (candidateId) {
+    try {
+      const byId = await getCandidate({ candidateId }, audit);
+      if (byId?.candidate?.id) {
+        rememberGemCandidateLinkedInKeys(byId.candidate);
+        return {
+          candidate: byId.candidate,
+          matchedBy: "candidateId"
+        };
+      }
+    } catch (_error) {
+      // Continue with the remaining lookup strategies.
+    }
+  }
+
+  if (linkedInHandle || linkedInUrl) {
+    const byLinkedIn = await findCandidateByLinkedIn(
+      {
+        linkedInHandle,
+        linkedInUrl
+      },
+      audit
+    );
+    if (byLinkedIn?.candidate?.id) {
+      return {
+        candidate: byLinkedIn.candidate,
+        matchedBy: linkedInHandle ? "linkedInHandle" : "linkedInUrl"
+      };
+    }
+  }
+
+  for (const email of emails) {
+    const byEmail = await findCandidateByEmail({ email }, audit);
+    if (byEmail?.candidate?.id) {
+      return {
+        candidate: byEmail.candidate,
+        matchedBy: "email"
+      };
+    }
+  }
+
+  const normalizedLinkedInKeys = new Set(
+    [normalizeLinkedInUrl(linkedInUrl), normalizeProfileUrl(linkedInUrl)].filter(Boolean)
+  );
+  for (const profileUrl of profileUrls) {
+    if (normalizedLinkedInKeys.has(normalizeProfileUrl(profileUrl))) {
+      continue;
+    }
+    const byProfileUrl = await findCandidateByProfileUrl({ profileUrl }, audit);
+    if (byProfileUrl?.candidate?.id) {
+      return {
+        candidate: byProfileUrl.candidate,
+        matchedBy: "profileUrl"
+      };
+    }
+  }
+
+  return {
+    candidate: null,
+    matchedBy: ""
+  };
+}
+
 function normalizeUserEmail(value) {
   return String(value || "")
     .trim()
@@ -4623,6 +4738,7 @@ async function uploadGemCandidateToAshby(payload, audit) {
 }
 
 const routes = {
+  "/api/candidates/resolve-context": (payload, audit) => resolveCandidateByContext(payload, audit),
   "/api/candidates/find-by-linkedin": (payload, audit) => findCandidateByLinkedIn(payload, audit),
   "/api/candidates/find-by-email": (payload, audit) => findCandidateByEmail(payload, audit),
   "/api/candidates/find-by-profile-url": (payload, audit) => findCandidateByProfileUrl(payload, audit),
