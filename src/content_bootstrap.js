@@ -76,6 +76,7 @@
     typeof DEFAULT_SETTINGS !== "undefined" ? DEFAULT_SETTINGS : FALLBACK_DEFAULT_SETTINGS;
   const GEM_STATUS_DISPLAY_MODE_SHORTCUT_ID = "cycleGemStatusDisplayMode";
   const PAGE_CHANGE_FORWARD_DELAY_MS = 650;
+  const PAGE_CHANGE_POLL_INTERVAL_MS = 300;
   const ACTIVE_RUNTIME_FILES = ["src/content.js"];
   const PASSIVE_RUNTIME_FILES = ["src/linkedin_passive.js"];
 
@@ -85,6 +86,7 @@
     pageUrl: "",
     passiveRuntimeEnsured: false,
     passiveRuntimeEnsurePromise: null,
+    pageUrlPollTimerId: 0,
     runtimeEnsured: false,
     runtimeEnsurePromise: null,
     pageChangeTimerId: 0,
@@ -678,12 +680,19 @@
       return;
     }
     state.pageUrl = nextUrl;
+    const hasRuntimeListener = state.runtimeEnsured || state.passiveRuntimeEnsured || isPassiveRuntimeReadyLocally();
     if (!isLinkedInProfilePage()) {
       clearPendingPassiveRuntimeEnsure();
+      if (hasRuntimeListener) {
+        dispatchDeferredRuntimeEvent("gls:linkedin-page-changed", {
+          reason,
+          pageUrl: nextUrl
+        });
+      }
       return;
     }
 
-    if (state.runtimeEnsured || state.passiveRuntimeEnsured || isPassiveRuntimeReadyLocally()) {
+    if (hasRuntimeListener) {
       dispatchDeferredRuntimeEvent("gls:linkedin-page-changed", {
         reason,
         pageUrl: nextUrl
@@ -709,6 +718,15 @@
 
     window.addEventListener("popstate", () => notifyPageChanged("popstate"), { passive: true });
     window.addEventListener("pageshow", () => notifyPageChanged("pageshow"), { passive: true });
+  }
+
+  function startPageUrlPoll() {
+    if (state.pageUrlPollTimerId) {
+      return;
+    }
+    state.pageUrlPollTimerId = window.setInterval(() => {
+      notifyPageChanged("poll");
+    }, PAGE_CHANGE_POLL_INTERVAL_MS);
   }
 
   async function cycleGemStatusDisplayModeSetting() {
@@ -882,6 +900,7 @@
       true
     );
     installHistoryObservers();
+    startPageUrlPoll();
 
     chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (message?.type === "PING") {

@@ -220,6 +220,10 @@
     clearIdentityRetryTimer();
   }
 
+  function invalidatePendingRefreshRequests() {
+    state.refreshRequestId += 1;
+  }
+
   function resetContextCache() {
     state.contextCache = {
       pageUrl: normalizePageUrl(window.location.href),
@@ -876,6 +880,7 @@
 
   async function refreshStatus(options = {}) {
     if (!isLinkedInProfilePage()) {
+      invalidatePendingRefreshRequests();
       clearPendingWork();
       hideIndicator();
       return;
@@ -884,6 +889,7 @@
       await getSettings().catch(() => {});
     }
     if (!isStatusEnabled()) {
+      invalidatePendingRefreshRequests();
       clearPendingWork();
       hideIndicator();
       return;
@@ -932,6 +938,7 @@
   function updateSettings(nextSettings) {
     state.cachedSettings = normalizeSettings(nextSettings || {});
     if (!isStatusEnabled()) {
+      invalidatePendingRefreshRequests();
       clearPendingWork();
       hideIndicator();
       return;
@@ -977,7 +984,13 @@
   }
 
   window.addEventListener("gls:linkedin-page-changed", () => {
+    invalidatePendingRefreshRequests();
+    clearPendingWork();
     resetContextCache();
+    hideIndicator();
+    if (!isLinkedInProfilePage()) {
+      return;
+    }
     scheduleDeferredRefresh(
       {
         forceRefresh: true,
