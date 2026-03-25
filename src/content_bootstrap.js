@@ -77,11 +77,14 @@
   const GEM_STATUS_DISPLAY_MODE_SHORTCUT_ID = "cycleGemStatusDisplayMode";
   const PAGE_CHANGE_FORWARD_DELAY_MS = 650;
   const PAGE_CHANGE_POLL_INTERVAL_MS = 300;
+  const INVITE_DECISION_TIMEOUT_MS = 1200;
+  const INVITE_DECISION_POLL_INTERVAL_MS = 50;
   const ACTIVE_RUNTIME_FILES = ["src/content.js"];
   const PASSIVE_RUNTIME_FILES = ["src/linkedin_passive.js"];
 
   const state = {
     cachedSettings: null,
+    contextRecoveryTriggered: false,
     initialized: false,
     pageUrl: "",
     passiveRuntimeEnsured: false,
@@ -93,6 +96,47 @@
     replayingShortcut: false
   };
   let toastContainer = null;
+
+  function markBootstrapRuntimeReadyForPage() {
+    try {
+      document.documentElement?.setAttribute("data-gls-bootstrap-runtime", "ready");
+      document.documentElement?.setAttribute("data-gls-bootstrap-version", String(CONTENT_RUNTIME_VERSION || ""));
+    } catch (_error) {
+      // Ignore DOM marker failures.
+    }
+  }
+
+  function markBootstrapShortcutListenerReadyForPage(source = "linkedin-bootstrap") {
+    try {
+      const root = document.documentElement;
+      if (!root) {
+        return;
+      }
+      root.setAttribute("data-gls-keydown-runtime", "ready");
+      root.setAttribute("data-gls-keydown-source", String(source || ""));
+    } catch (_error) {
+      // Ignore DOM marker failures.
+    }
+  }
+
+  function markConfiguredShortcutDiagnosticsForPage() {
+    try {
+      const root = document.documentElement;
+      if (!root) {
+        return;
+      }
+      root.setAttribute("data-gls-shortcut-linkedin-connect", getConfiguredShortcut("linkedinConnect"));
+      root.setAttribute("data-gls-shortcut-linkedin-message", getConfiguredShortcut("linkedinMessageProfile"));
+      root.setAttribute("data-gls-shortcut-linkedin-contact", getConfiguredShortcut("linkedinContactInfo"));
+      root.setAttribute(
+        "data-gls-shortcut-linkedin-view-in-recruiter",
+        getConfiguredShortcut("linkedinViewInRecruiter")
+      );
+      root.setAttribute("data-gls-shortcut-linkedin-see-more", getConfiguredShortcut("linkedinExpandSeeMore"));
+    } catch (_error) {
+      // Ignore DOM marker failures.
+    }
+  }
 
   function clearPendingPassiveRuntimeEnsure() {
     if (!state.pageChangeTimerId) {
@@ -196,9 +240,9 @@
     return ordered.join("+");
   }
 
-  function bootstrapKeyboardEventToShortcut(event) {
+  function bootstrapKeyboardEventToShortcut(event, options = {}) {
     if (typeof keyboardEventToShortcut === "function") {
-      return keyboardEventToShortcut(event);
+      return keyboardEventToShortcut(event, options);
     }
     if (!event) {
       return "";
@@ -217,7 +261,22 @@
       parts.push("Alt");
     }
 
-    let key = String(event.key || "").trim();
+    const preferLegacyCode = Boolean(options.preferLegacyCode);
+    let key = "";
+    if (preferLegacyCode) {
+      const code = String(event.code || "");
+      if (/^Key[A-Z]$/.test(code)) {
+        key = code.slice(3);
+      } else if (/^Digit[0-9]$/.test(code)) {
+        key = code.slice(5);
+      } else if (code === "Space") {
+        key = "Space";
+      } else {
+        key = String(event.key || "").trim();
+      }
+    } else {
+      key = String(event.key || "").trim();
+    }
     if (!key) {
       return "";
     }
@@ -228,6 +287,21 @@
     }
     parts.push(key);
     return parts.join("+");
+  }
+
+  function getBootstrapEventShortcutCandidates(event) {
+    const candidates = [];
+    const primaryShortcut = bootstrapNormalizeShortcut(bootstrapKeyboardEventToShortcut(event));
+    if (primaryShortcut) {
+      candidates.push(primaryShortcut);
+    }
+    const legacyShortcut = bootstrapNormalizeShortcut(
+      bootstrapKeyboardEventToShortcut(event, { preferLegacyCode: true })
+    );
+    if (legacyShortcut && !candidates.includes(legacyShortcut)) {
+      candidates.push(legacyShortcut);
+    }
+    return candidates;
   }
 
   function bootstrapNormalizeGemStatusDisplayMode(rawValue, fallbackEnabled = true) {
@@ -410,6 +484,26 @@
     return "LinkedIn profile detected, but no stable candidate identity signal was found.";
   }
 
+  function isContextInvalidatedError(message) {
+    return /Extension context invalidated|Receiving end does not exist|The message port closed before a response was received|chrome-extension:\/\/invalid/i.test(
+      String(message || "")
+    );
+  }
+
+  function triggerContextRecovery(message) {
+    if (state.contextRecoveryTriggered) {
+      return;
+    }
+    state.contextRecoveryTriggered = true;
+    showToast("Extension was updated. Reloading this tab...", true);
+    window.setTimeout(() => {
+      window.location.reload();
+    }, 900);
+    if (typeof console !== "undefined" && typeof console.warn === "function") {
+      console.warn("[GLS] bootstrap context invalidated:", message || "Extension context invalidated.");
+    }
+  }
+
   function getCurrentGemStatusDisplayMode(settings = state.cachedSettings || BOOTSTRAP_DEFAULT_SETTINGS) {
     const baseline = settings || {};
     return bootstrapNormalizeGemStatusDisplayMode(
@@ -426,8 +520,15 @@
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(payload, (response) => {
         if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message || "Runtime message failed."));
+          const message = chrome.runtime.lastError.message || "Runtime message failed.";
+          if (isContextInvalidatedError(message)) {
+            triggerContextRecovery(message);
+          }
+          reject(new Error(message));
           return;
+        }
+        if (isContextInvalidatedError(response?.message || "")) {
+          triggerContextRecovery(response?.message || "Extension context invalidated.");
         }
         resolve(response);
       });
@@ -448,6 +549,9 @@
   function getSettings() {
     return sendRuntimeMessage({ type: "GET_SETTINGS" }).then((response) => {
       if (!response?.ok) {
+        if (isContextInvalidatedError(response?.message || "")) {
+          triggerContextRecovery(response?.message || "Extension context invalidated.");
+        }
         throw new Error(response?.message || "Could not load settings.");
       }
       const settings = normalizeSettings(response.settings || {});
@@ -459,6 +563,9 @@
   function saveSettings(settings) {
     return sendRuntimeMessage({ type: "SAVE_SETTINGS", settings }).then((response) => {
       if (!response?.ok) {
+        if (isContextInvalidatedError(response?.message || "")) {
+          triggerContextRecovery(response?.message || "Extension context invalidated.");
+        }
         throw new Error(response?.message || "Could not save settings.");
       }
       state.cachedSettings = normalizeSettings(settings);
@@ -482,11 +589,11 @@
     if (!expectedShortcut) {
       return false;
     }
-    const actualShortcut = bootstrapNormalizeShortcut(bootstrapKeyboardEventToShortcut(event));
-    if (!actualShortcut) {
+    const actualShortcuts = getBootstrapEventShortcutCandidates(event);
+    if (actualShortcuts.length === 0) {
       return false;
     }
-    return actualShortcut === expectedShortcut;
+    return actualShortcuts.includes(expectedShortcut);
   }
 
   function findActionByShortcut(shortcut) {
@@ -497,6 +604,16 @@
         (actionId) => validActionIds.has(actionId) && bootstrapNormalizeShortcut(mapping[actionId]) === shortcut
       ) || ""
     );
+  }
+
+  function findActionByShortcutCandidates(shortcuts = []) {
+    for (const shortcut of shortcuts) {
+      const actionId = findActionByShortcut(shortcut);
+      if (actionId) {
+        return actionId;
+      }
+    }
+    return "";
   }
 
   function replayKeyboardEvent(event) {
@@ -573,6 +690,232 @@
       card.style.transform = "translateY(6px)";
       window.setTimeout(() => card.remove(), 160);
     }, 2200);
+  }
+
+  function isElementVisible(element) {
+    if (!element || typeof element.getBoundingClientRect !== "function") {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+      return false;
+    }
+    return true;
+  }
+
+  function isCandidateDisabled(candidate) {
+    if (!candidate) {
+      return true;
+    }
+    return (
+      candidate.getAttribute("disabled") !== null ||
+      candidate.getAttribute("aria-disabled") === "true" ||
+      candidate.classList.contains("artdeco-button--disabled")
+    );
+  }
+
+  function getElementLabel(element) {
+    if (!element) {
+      return "";
+    }
+    return [
+      element.getAttribute("aria-label") || "",
+      element.getAttribute("title") || "",
+      element.innerText || "",
+      element.textContent || ""
+    ]
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function querySelectorAllDeep(root, selector) {
+    if (!root || typeof root.querySelectorAll !== "function" || !selector) {
+      return [];
+    }
+
+    const results = [];
+    const seenRoots = new Set();
+    const seenElements = new Set();
+    const queue = [root];
+
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || seenRoots.has(current) || typeof current.querySelectorAll !== "function") {
+        continue;
+      }
+      seenRoots.add(current);
+
+      if (current instanceof Element && typeof current.matches === "function" && current.matches(selector) && !seenElements.has(current)) {
+        seenElements.add(current);
+        results.push(current);
+      }
+
+      for (const candidate of current.querySelectorAll(selector)) {
+        if (seenElements.has(candidate)) {
+          continue;
+        }
+        seenElements.add(candidate);
+        results.push(candidate);
+      }
+
+      for (const candidate of current.querySelectorAll("*")) {
+        if (candidate?.shadowRoot && !seenRoots.has(candidate.shadowRoot)) {
+          queue.push(candidate.shadowRoot);
+        }
+      }
+    }
+
+    return results;
+  }
+
+  function findVisibleInviteDecisionButtons() {
+    const roots = [document.getElementById("interop-outlet"), document.body, document.documentElement].filter(Boolean);
+    const seen = new Set();
+    let addNoteButton = null;
+    let sendWithoutNoteButton = null;
+
+    for (const root of roots) {
+      if (seen.has(root) || typeof root.querySelectorAll !== "function") {
+        continue;
+      }
+      seen.add(root);
+      const candidates = querySelectorAllDeep(root, "button, a[role='button'], [role='button']");
+      for (const candidate of candidates) {
+        if (!isElementVisible(candidate) || isCandidateDisabled(candidate)) {
+          continue;
+        }
+        const label = getElementLabel(candidate);
+        if (!addNoteButton && (label === "add a note" || label.startsWith("add a note"))) {
+          addNoteButton = candidate;
+        }
+        if (
+          !sendWithoutNoteButton &&
+          (label.includes("send without a note") ||
+            (label.includes("send") && label.includes("without") && label.includes("note")))
+        ) {
+          sendWithoutNoteButton = candidate;
+        }
+        if (addNoteButton && sendWithoutNoteButton) {
+          return { addNoteButton, sendWithoutNoteButton };
+        }
+      }
+
+      if (!addNoteButton || !sendWithoutNoteButton) {
+        const textCandidates = querySelectorAllDeep(root, "*");
+        for (const candidate of textCandidates) {
+          if (!isElementVisible(candidate)) {
+            continue;
+          }
+          const label = getElementLabel(candidate);
+          const button = candidate.closest("button, a[role='button'], [role='button']");
+          if (!button || !isElementVisible(button) || isCandidateDisabled(button)) {
+            continue;
+          }
+          if (!addNoteButton && (label === "add a note" || label.startsWith("add a note"))) {
+            addNoteButton = button;
+          }
+          if (
+            !sendWithoutNoteButton &&
+            (label.includes("send without a note") ||
+              (label.includes("send") && label.includes("without") && label.includes("note")))
+          ) {
+            sendWithoutNoteButton = button;
+          }
+          if (addNoteButton && sendWithoutNoteButton) {
+            return { addNoteButton, sendWithoutNoteButton };
+          }
+        }
+      }
+    }
+
+    return { addNoteButton, sendWithoutNoteButton };
+  }
+
+  function hasVisibleInviteDecisionDialogShell() {
+    const selectors = [
+      "#interop-outlet .artdeco-modal",
+      "#interop-outlet .artdeco-modal-overlay",
+      "#interop-outlet [role='dialog']",
+      ".artdeco-modal.send-invite",
+      ".send-invite"
+    ];
+    for (const candidate of document.querySelectorAll(selectors.join(","))) {
+      if (!isElementVisible(candidate)) {
+        continue;
+      }
+      const label = getElementLabel(candidate);
+      if (
+        label.includes("add a note") ||
+        label.includes("send without a note") ||
+        label.includes("invitation") ||
+        label.includes("invite")
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function waitForInviteDecisionButton(kind, timeoutMs = INVITE_DECISION_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+
+      const poll = () => {
+        const { addNoteButton, sendWithoutNoteButton } = findVisibleInviteDecisionButtons();
+        const targetButton = kind === "send-without-note" ? sendWithoutNoteButton : addNoteButton;
+        if (targetButton) {
+          resolve(targetButton);
+          return;
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          resolve(null);
+          return;
+        }
+        window.setTimeout(poll, INVITE_DECISION_POLL_INTERVAL_MS);
+      };
+
+      poll();
+    });
+  }
+
+  function handleInviteDecisionShortcut(event) {
+    const wantsSendWithoutNote = isConfiguredShortcut(event, "linkedinInviteSendWithoutNote");
+    const wantsAddNote = isConfiguredShortcut(event, "linkedinInviteAddNote");
+    if (!wantsSendWithoutNote && !wantsAddNote) {
+      return false;
+    }
+
+    const action = wantsSendWithoutNote ? "send-without-note" : "add-note";
+    if (!hasVisibleInviteDecisionDialogShell()) {
+      return false;
+    }
+
+    event.preventDefault();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    } else {
+      event.stopPropagation();
+    }
+
+    waitForInviteDecisionButton(action)
+      .then((targetButton) => {
+        if (!targetButton) {
+          showToast("Could not find invite action button.", true);
+          return;
+        }
+        targetButton.click();
+        showToast(action === "send-without-note" ? "Send without note selected." : "Add note selected.");
+      })
+      .catch(() => {
+        showToast("Could not trigger invite action.", true);
+      });
+    return true;
   }
 
   function ensureContentRuntime(reason = "") {
@@ -767,15 +1110,19 @@
       return;
     }
 
-    const actualShortcut = bootstrapNormalizeShortcut(bootstrapKeyboardEventToShortcut(event));
-    if (!actualShortcut) {
+    if (handleInviteDecisionShortcut(event)) {
+      return;
+    }
+
+    const actualShortcuts = getBootstrapEventShortcutCandidates(event);
+    if (actualShortcuts.length === 0) {
       return;
     }
 
     const linkedInShortcutId = BOOTSTRAP_LINKEDIN_NATIVE_SHORTCUT_IDS.find(
-      (shortcutId) => bootstrapNormalizeShortcut(getConfiguredShortcut(shortcutId)) === actualShortcut
+      (shortcutId) => actualShortcuts.includes(bootstrapNormalizeShortcut(getConfiguredShortcut(shortcutId)))
     );
-    const actionId = findActionByShortcut(actualShortcut);
+    const actionId = findActionByShortcutCandidates(actualShortcuts);
     if (!linkedInShortcutId && !actionId) {
       return;
     }
@@ -812,6 +1159,7 @@
 
   function handleSettingsUpdatedMessage(message, sendResponse) {
     state.cachedSettings = normalizeSettings(message.settings || {});
+    markConfiguredShortcutDiagnosticsForPage();
     const finish = () => {
       dispatchDeferredRuntimeEvent("gls:settings-updated", {
         settings: state.cachedSettings
@@ -890,6 +1238,9 @@
       return;
     }
     state.initialized = true;
+    markBootstrapRuntimeReadyForPage();
+    markBootstrapShortcutListenerReadyForPage();
+    markConfiguredShortcutDiagnosticsForPage();
     state.pageUrl = normalizePageUrl();
 
     window.addEventListener(
@@ -936,6 +1287,7 @@
         return;
       }
       state.cachedSettings = normalizeSettings(changes.settings.newValue || {});
+      markConfiguredShortcutDiagnosticsForPage();
       dispatchDeferredRuntimeEvent("gls:settings-updated", {
         settings: state.cachedSettings
       });
@@ -948,8 +1300,13 @@
 
     try {
       await getSettings();
+      markConfiguredShortcutDiagnosticsForPage();
     } catch (_error) {
+      if (state.contextRecoveryTriggered) {
+        return;
+      }
       state.cachedSettings = normalizeSettings({});
+      markConfiguredShortcutDiagnosticsForPage();
     }
 
     if (state.cachedSettings?.enabled && isCurrentGemStatusDisplayEnabled(state.cachedSettings) && isLinkedInProfilePage()) {

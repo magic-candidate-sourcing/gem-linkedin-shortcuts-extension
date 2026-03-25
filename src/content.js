@@ -1,6 +1,6 @@
 "use strict";
 
-if (!window.__GLS_UNIFIED_CONTENT_RUNTIME_READY__) {
+if (!window.__GLS_UNIFIED_CONTENT_RUNTIME_READY__ || window.__GLS_UNIFIED_CONTENT_RUNTIME_VERSION__ !== CONTENT_RUNTIME_VERSION) {
 window.__GLS_UNIFIED_CONTENT_RUNTIME_READY__ = true;
 window.__GLS_UNIFIED_CONTENT_RUNTIME_VERSION__ = CONTENT_RUNTIME_VERSION;
 
@@ -29,6 +29,8 @@ const LINKEDIN_SHORTCUT_IDS = {
 const GEM_STATUS_DISPLAY_MODE_SHORTCUT_ID = "cycleGemStatusDisplayMode";
 const LINKEDIN_EXPAND_MORE_MAX_PASSES = 6;
 const LINKEDIN_EXPAND_MORE_PASS_DELAY_MS = 110;
+const LINKEDIN_INVITE_DECISION_TIMEOUT_MS = 1200;
+const LINKEDIN_INVITE_DECISION_POLL_INTERVAL_MS = 50;
 const CANDIDATE_NOTE_MAX_LENGTH = 10000;
 const REMINDER_PRESET_SHORTCUTS = [
   { key: "a", label: "1 week", kind: "days", amount: 7 },
@@ -41,6 +43,7 @@ const EMAIL_MENU_VIEW_ALL_KEY = "d";
 const PROFILE_ACTION_BAND_TOP_OFFSET = 160;
 const PROFILE_ACTION_BAND_BOTTOM_OFFSET = 420;
 const PROFILE_ACTION_COLUMN_MAX_X_OFFSET = 520;
+const PROFILE_ACTION_FALLBACK_MAX_TOP = 500;
 const CUSTOM_FIELD_MEMORY_CACHE_LIMIT = 40;
 const CUSTOM_FIELD_MEMORY_TTL_MS = 30 * 60 * 1000;
 const CANDIDATE_EMAIL_MEMORY_CACHE_LIMIT = 80;
@@ -101,6 +104,100 @@ let profileIdentityCache = {
 };
 
 window.__GLS_UNIFIED_CONTENT_ACTIVE__ = true;
+
+function markContentRuntimeReadyForPage() {
+  try {
+    document.documentElement?.setAttribute("data-gls-content-runtime", "ready");
+    document.documentElement?.setAttribute("data-gls-content-version", String(CONTENT_RUNTIME_VERSION || ""));
+  } catch (_error) {
+    // Ignore DOM marker failures.
+  }
+}
+
+function markContentShortcutListenerReadyForPage(source = "") {
+  try {
+    document.documentElement?.setAttribute("data-gls-keydown-runtime", "ready");
+    document.documentElement?.setAttribute("data-gls-keydown-source", String(source || ""));
+  } catch (_error) {
+    // Ignore DOM marker failures.
+  }
+}
+
+function markConfiguredShortcutDiagnosticsForPage() {
+  try {
+    const root = document.documentElement;
+    if (!root) {
+      return;
+    }
+    root.setAttribute("data-gls-shortcut-linkedin-connect", getConfiguredLinkedInShortcut(LINKEDIN_SHORTCUT_IDS.CONNECT));
+    root.setAttribute("data-gls-shortcut-linkedin-message", getConfiguredLinkedInShortcut(LINKEDIN_SHORTCUT_IDS.MESSAGE_PROFILE));
+    root.setAttribute("data-gls-shortcut-linkedin-contact", getConfiguredLinkedInShortcut(LINKEDIN_SHORTCUT_IDS.CONTACT_INFO));
+    root.setAttribute(
+      "data-gls-shortcut-linkedin-view-in-recruiter",
+      getConfiguredLinkedInShortcut(LINKEDIN_SHORTCUT_IDS.VIEW_IN_RECRUITER)
+    );
+    root.setAttribute("data-gls-shortcut-linkedin-see-more", getConfiguredLinkedInShortcut(LINKEDIN_SHORTCUT_IDS.EXPAND_SEE_MORE));
+  } catch (_error) {
+    // Ignore DOM marker failures.
+  }
+}
+
+function markLastShortcutDiagnosticsForPage(details = {}) {
+  try {
+    const root = document.documentElement;
+    if (!root) {
+      return;
+    }
+    root.setAttribute("data-gls-last-shortcut", String(details.shortcut || ""));
+    root.setAttribute("data-gls-last-shortcut-key", String(details.key || ""));
+    root.setAttribute("data-gls-last-shortcut-code", String(details.code || ""));
+    root.setAttribute("data-gls-last-shortcut-target", String(details.target || ""));
+    root.setAttribute("data-gls-last-shortcut-supported", details.supported ? "true" : "false");
+    root.setAttribute("data-gls-last-shortcut-linkedin", details.linkedin ? "true" : "false");
+    root.setAttribute("data-gls-last-shortcut-public", details.linkedinPublic ? "true" : "false");
+    root.setAttribute("data-gls-last-shortcut-recruiter", details.linkedinRecruiter ? "true" : "false");
+    root.setAttribute("data-gls-last-shortcut-editable", details.editable ? "true" : "false");
+    root.setAttribute("data-gls-last-shortcut-match", String(details.match || ""));
+  } catch (_error) {
+    // Ignore DOM marker failures.
+  }
+}
+
+function markLastLinkedInActionDiagnosticsForPage(details = {}) {
+  try {
+    const root = document.documentElement;
+    if (!root) {
+      return;
+    }
+    root.setAttribute("data-gls-last-linkedin-action", String(details.action || ""));
+    root.setAttribute("data-gls-last-linkedin-action-stage", String(details.stage || ""));
+    root.setAttribute("data-gls-last-linkedin-action-shortcut", String(details.shortcut || ""));
+    root.setAttribute("data-gls-last-linkedin-action-clicked", String(details.clicked || ""));
+    root.setAttribute("data-gls-last-linkedin-action-top-card-root", details.topCardRootFound ? "true" : "false");
+    root.setAttribute("data-gls-last-linkedin-action-heading", details.headingFound ? "true" : "false");
+    root.setAttribute("data-gls-last-linkedin-action-search-roots", String(details.searchRootCount || 0));
+  } catch (_error) {
+    // Ignore DOM marker failures.
+  }
+}
+
+function debugContentRuntime(eventName, details = {}) {
+  try {
+    if (typeof console !== "undefined" && typeof console.log === "function") {
+      console.log("[GLS]", eventName, {
+        href: window.location.href,
+        ...details
+      });
+    } else if (typeof console !== "undefined" && typeof console.info === "function") {
+      console.info("[GLS]", eventName, {
+        href: window.location.href,
+        ...details
+      });
+    }
+  } catch (_error) {
+    // Ignore console failures.
+  }
+}
 
 function isContextInvalidatedError(message) {
   return /Extension context invalidated|Receiving end does not exist|The message port closed before a response was received/i.test(
@@ -599,7 +696,6 @@ function collectDocumentAnchorUrls(options = {}) {
   const maxAnchors = Math.max(1, Number(options.maxAnchors) || 300);
   const urls = [];
   const seen = new Set();
-  const anchors = Array.from(document.querySelectorAll("a[href], a[data-saferedirecturl]")).slice(0, maxAnchors);
   const add = (value) => {
     const normalized = unwrapKnownRedirectUrl(value);
     if (!normalized || seen.has(normalized)) {
@@ -608,11 +704,52 @@ function collectDocumentAnchorUrls(options = {}) {
     seen.add(normalized);
     urls.push(normalized);
   };
-  anchors.forEach((anchor) => {
-    add(anchor.getAttribute("href"));
-    add(anchor.getAttribute("data-saferedirecturl"));
-    add(anchor.href);
+  Array.from(document.querySelectorAll("a[href], a[data-saferedirecturl]"))
+    .slice(0, maxAnchors)
+    .forEach((anchor) => {
+      add(anchor.getAttribute("href"));
+      add(anchor.getAttribute("data-saferedirecturl"));
+      add(anchor.href);
+    });
+  return urls;
+}
+
+function readUrlsFromString(value, outputSet) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return;
+  }
+  const matches = text.match(/https?:\/\/[^\s<>"')]+/gi) || [];
+  matches.forEach((match) => {
+    outputSet.add(unwrapKnownRedirectUrl(match));
   });
+}
+
+function collectDocumentTextUrls(options = {}) {
+  const maxNodes = Math.max(1, Number(options.maxNodes) || 120);
+  const urls = [];
+  const seen = new Set();
+  const add = (value) => {
+    const normalized = unwrapKnownRedirectUrl(value);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    urls.push(normalized);
+  };
+
+  Array.from(document.querySelectorAll("main, article, section, body"))
+    .slice(0, Math.min(maxNodes, 20))
+    .forEach((node) => {
+      const text = String(node?.textContent || "");
+      if (!text) {
+        return;
+      }
+      const buffer = new Set();
+      readUrlsFromString(text, buffer);
+      buffer.forEach((url) => add(url));
+    });
+
   return urls;
 }
 
@@ -623,27 +760,11 @@ function findLinkedInUrlInDocument() {
       return fromDom;
     }
   }
-  const anchors = collectDocumentAnchorUrls({ maxAnchors: 350 });
-  for (const href of anchors) {
+  const urls = [...collectDocumentAnchorUrls({ maxAnchors: 350 }), ...collectDocumentTextUrls({ maxNodes: 40 })];
+  for (const href of urls) {
     const canonical = toCanonicalLinkedInPublicProfileUrl(href);
     if (canonical) {
       return canonical;
-    }
-  }
-  return "";
-}
-
-function findGemCandidateUrlInDocument() {
-  const anchors = collectDocumentAnchorUrls({ maxAnchors: 350 });
-  for (const href of anchors) {
-    try {
-      const parsed = new URL(href, window.location.origin);
-      if (!isGemHost(parsed.hostname) || !isGemCandidateProfilePath(parsed.pathname)) {
-        continue;
-      }
-      return normalizeUrlForContext(parsed.toString());
-    } catch (_error) {
-      // Ignore malformed URLs.
     }
   }
   return "";
@@ -659,44 +780,165 @@ function getConfiguredUserEmail() {
   return isValidEmailAddressForPicker(email) ? email : "";
 }
 
-function collectGmailContactEmails() {
-  const ignored = new Set(["no-reply@gem.com", "noreply@gem.com"]);
-  const configuredUserEmail = getConfiguredUserEmail();
-  if (configuredUserEmail) {
-    ignored.add(configuredUserEmail);
-  }
-  return collectEmailAddressesFromDom({
-    selectors: [
-      "a[href^='mailto:']",
-      "[data-hovercard-id]",
-      "[data-email]",
-      "span[email]",
-      "div[email]",
-      "[email]",
-      "[aria-label*='@']"
-    ],
-    maxNodes: 600
-  }).filter((email) => !ignored.has(String(email || "").trim().toLowerCase()) && !isGemAutomatedThreadEmail(email));
+function normalizeGmailThreadText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-function getGmailProfileName(contactEmails = []) {
-  const candidateEmails = new Set(
-    (Array.isArray(contactEmails) ? contactEmails : [])
-      .map((email) => normalizeEmailAddressForPicker(email).toLowerCase())
-      .filter(Boolean)
-  );
-  if (candidateEmails.size === 0) {
-    return "";
+function collectGmailVisibleAccountEmails() {
+  const emails = new Set();
+  Array.from(
+    document.querySelectorAll(
+      "a[aria-label*='Google Account'], button[aria-label*='Google Account'], div[aria-label*='Google Account'], img[alt*='Google Account']"
+    )
+  )
+    .slice(0, 40)
+    .forEach((node) => {
+      readEmailsFromString(node.getAttribute("aria-label"), emails);
+      readEmailsFromString(node.getAttribute("title"), emails);
+      readEmailsFromString(node.getAttribute("alt"), emails);
+      readEmailsFromString(node.textContent, emails);
+    });
+  const configuredUserEmail = getConfiguredUserEmail();
+  if (configuredUserEmail) {
+    emails.add(configuredUserEmail);
   }
-  const nodes = Array.from(document.querySelectorAll("[data-hovercard-id]")).slice(0, 200);
-  for (const node of nodes) {
-    const email = normalizeEmailAddressForPicker(node.getAttribute("data-hovercard-id") || "").toLowerCase();
-    if (!email || !candidateEmails.has(email)) {
+  return Array.from(emails)
+    .map((email) => normalizeEmailAddressForPicker(email).toLowerCase())
+    .filter((email) => isValidEmailAddressForPicker(email));
+}
+
+function getGmailThreadRoots() {
+  const roots = Array.from(document.querySelectorAll("[data-message-id], .adn.ads")).slice(0, 80);
+  return roots.length > 0 ? roots : [document];
+}
+
+function getGmailThreadSubject() {
+  const selectors = ["h2[data-thread-perm-id]", "h2.hP", "h2[role='heading']", "[role='main'] h2"];
+  for (const selector of selectors) {
+    const node = document.querySelector(selector);
+    const text = normalizeGmailThreadText(node?.textContent || node?.getAttribute("aria-label") || "");
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function collectGmailVisibleParticipantEntries() {
+  const currentUserEmails = new Set(collectGmailVisibleAccountEmails());
+  const participantMap = new Map();
+
+  const upsert = (emailValue, labelValue, rootIndex) => {
+    const extractedEmails = new Set();
+    readEmailsFromString(emailValue, extractedEmails);
+    if (extractedEmails.size === 0) {
+      extractedEmails.add(normalizeEmailAddressForPicker(emailValue).toLowerCase());
+    }
+    const email = String(Array.from(extractedEmails)[0] || "").toLowerCase();
+    if (!isValidEmailAddressForPicker(email)) {
+      return;
+    }
+    const label = normalizeGmailThreadText(labelValue).replace(/\s*<[^>]+>\s*$/, "");
+    const normalizedLabel = label.toLowerCase();
+    const existing = participantMap.get(email) || {
+      email,
+      label: "",
+      occurrences: 0,
+      firstIndex: Number.isFinite(rootIndex) ? rootIndex : 9999
+    };
+    existing.occurrences += 1;
+    existing.firstIndex = Math.min(existing.firstIndex, Number.isFinite(rootIndex) ? rootIndex : existing.firstIndex);
+    if (!existing.label && label && !/@/.test(label) && label.length <= 120) {
+      existing.label = label;
+    }
+    existing.isCurrentUser = currentUserEmails.has(email) || existing.isCurrentUser === true;
+    existing.isGem = isGemAutomatedThreadEmail(email) || normalizedLabel === "gem" || existing.isGem === true;
+    participantMap.set(email, existing);
+  };
+
+  getGmailThreadRoots().forEach((root, rootIndex) => {
+    Array.from(root.querySelectorAll("[data-hovercard-id]"))
+      .slice(0, 40)
+      .forEach((node) => {
+        const email = node.getAttribute("data-hovercard-id") || "";
+        const label =
+          node.getAttribute("name") ||
+          node.getAttribute("data-name") ||
+          node.getAttribute("aria-label") ||
+          node.textContent ||
+          "";
+        upsert(email, label, rootIndex);
+      });
+
+    Array.from(root.querySelectorAll("a[href^='mailto:']"))
+      .slice(0, 20)
+      .forEach((node) => {
+        upsert(node.getAttribute("href"), node.textContent || node.getAttribute("aria-label") || "", rootIndex);
+      });
+  });
+
+  return Array.from(participantMap.values()).sort((left, right) => {
+    if (left.isCurrentUser !== right.isCurrentUser) {
+      return left.isCurrentUser ? 1 : -1;
+    }
+    if (left.isGem !== right.isGem) {
+      return left.isGem ? 1 : -1;
+    }
+    if (left.firstIndex !== right.firstIndex) {
+      return left.firstIndex - right.firstIndex;
+    }
+    if (left.occurrences !== right.occurrences) {
+      return right.occurrences - left.occurrences;
+    }
+    return left.email.localeCompare(right.email);
+  });
+}
+
+function collectGmailVisibleParticipantEmails() {
+  const participantEntries = collectGmailVisibleParticipantEntries().filter((entry) => !entry.isCurrentUser && !entry.isGem);
+  if (participantEntries.length > 0) {
+    return participantEntries.map((entry) => entry.email);
+  }
+
+  const ignored = new Set(["no-reply@gem.com", "noreply@gem.com", ...collectGmailVisibleAccountEmails()]);
+  const emails = [];
+  const seen = new Set();
+  const add = (value) => {
+    const normalized = normalizeEmailAddressForPicker(value).toLowerCase();
+    if (!normalized || seen.has(normalized) || ignored.has(normalized) || isGemAutomatedThreadEmail(normalized)) {
+      return;
+    }
+    if (!isValidEmailAddressForPicker(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    emails.push(normalized);
+  };
+
+  getGmailThreadRoots().forEach((root) => {
+    Array.from(root.querySelectorAll("[data-hovercard-id], a[href^='mailto:'], [data-email], [email]"))
+      .slice(0, 120)
+      .forEach((node) => {
+        add(node.getAttribute("data-hovercard-id"));
+        add(node.getAttribute("data-email"));
+        add(node.getAttribute("email"));
+        add(node.getAttribute("href"));
+        add(node.getAttribute("aria-label"));
+        add(node.textContent);
+      });
+  });
+
+  return emails;
+}
+
+function getGmailPrimaryParticipantName(participantEntries = []) {
+  for (const entry of Array.isArray(participantEntries) ? participantEntries : []) {
+    if (entry?.isCurrentUser || entry?.isGem) {
       continue;
     }
-    const text = String(node.textContent || "")
-      .replace(/\s+/g, " ")
-      .trim();
+    const text = normalizeGmailThreadText(entry?.label || "");
     if (text && !/@/.test(text) && text.length <= 120) {
       return text;
     }
@@ -826,21 +1068,23 @@ function getGmailContext() {
   const pageUrl = normalizePageUrlForWatcher(window.location.href);
   const gmailThreadUrl = normalizeUrlForContext(window.location.href, { keepHash: true });
   const gmailThreadToken = extractGmailThreadTokenFromUrl(window.location.href);
-  const gemProfileUrl = findGemCandidateUrlInDocument();
-  const gemCandidateId = extractGemCandidateIdFromUrl(gemProfileUrl);
-  const linkedinUrl = findLinkedInUrlInDocument();
-  const contactEmails = collectGmailContactEmails();
-  const profileName = getGmailProfileName(contactEmails);
+  const gmailSubject = getGmailThreadSubject();
+  const gmailAccountEmails = collectGmailVisibleAccountEmails();
+  const participantEntries = collectGmailVisibleParticipantEntries();
+  const contactEmails = collectGmailVisibleParticipantEmails();
+  const profileName = getGmailPrimaryParticipantName(participantEntries);
   return {
     sourcePlatform: "gmail",
     pageUrl,
-    profileUrl: linkedinUrl || "",
+    profileUrl: "",
     gmailThreadUrl,
     gmailThreadToken,
-    gemProfileUrl,
-    gemCandidateId,
-    linkedinUrl,
-    linkedInHandle: getLinkedInHandle(linkedinUrl),
+    gmailSubject,
+    gmailAccountEmails,
+    gemProfileUrl: "",
+    gemCandidateId: "",
+    linkedinUrl: "",
+    linkedInHandle: "",
     contactEmails,
     contactEmail: contactEmails[0] || "",
     profileName
@@ -1582,6 +1826,7 @@ function getContextLink(context) {
     String(context?.linkedinUrl || "").trim() ||
     String(context?.profileUrl || "").trim() ||
     String(context?.gemProfileUrl || "").trim() ||
+    String(context?.gmailThreadUrl || "").trim() ||
     String(context?.pageUrl || "").trim() ||
     window.location.href
   );
@@ -1620,6 +1865,15 @@ function contextHasResolvableIdentity(context) {
   if (!context || typeof context !== "object") {
     return false;
   }
+  if (String(context.sourcePlatform || "").trim().toLowerCase() === "gmail") {
+    return Boolean(
+      String(context.gmailThreadToken || "").trim() ||
+        String(context.gmailSubject || "").trim() ||
+        isValidEmailAddressForPicker(String(context.contactEmail || "").trim()) ||
+        (Array.isArray(context.contactEmails) &&
+          context.contactEmails.some((email) => isValidEmailAddressForPicker(email)))
+    );
+  }
   if (String(context.gemCandidateId || "").trim()) {
     return true;
   }
@@ -1650,6 +1904,25 @@ function describeContextSignals(context) {
   const contactEmails = Array.isArray(context?.contactEmails)
     ? context.contactEmails.filter((email) => isValidEmailAddressForPicker(email))
     : [];
+  const gmailSubject = normalizeGmailThreadText(context?.gmailSubject || "");
+
+  if (sourcePlatform === "gmail") {
+    if (gmailSubject) {
+      signals.push("subject");
+    }
+    if (String(context?.gmailThreadToken || "").trim()) {
+      signals.push("thread token");
+    }
+    if (contactEmails.length > 0) {
+      signals.push(`${contactEmails.length} visible email${contactEmails.length === 1 ? "" : "s"}`);
+    } else if (isValidEmailAddressForPicker(String(context?.contactEmail || "").trim())) {
+      signals.push("1 visible email");
+    }
+    if (signals.length === 0) {
+      return "Gmail thread detected, but no visible subject or participant email was found.";
+    }
+    return `Gmail thread detected. Signals: ${signals.join(", ")}.`;
+  }
 
   if (String(context?.gemCandidateId || "").trim()) {
     signals.push("Gem candidate ID");
@@ -1672,9 +1945,6 @@ function describeContextSignals(context) {
   }
 
   if (signals.length === 0) {
-    if (sourcePlatform === "gmail") {
-      return "Gmail thread detected, but no Gem profile link, LinkedIn profile, or candidate email was found.";
-    }
     if (sourcePlatform === "linkedin") {
       return "LinkedIn profile detected, but no stable candidate identity signal was found.";
     }
@@ -10505,7 +10775,11 @@ function isConfiguredShortcut(event, shortcutId) {
   if (!actualShortcut) {
     return false;
   }
-  return actualShortcut === expectedShortcut;
+  if (actualShortcut === expectedShortcut) {
+    return true;
+  }
+  const legacyShortcut = normalizeShortcut(keyboardEventToShortcut(event, { preferLegacyCode: true }));
+  return Boolean(legacyShortcut) && legacyShortcut === expectedShortcut;
 }
 
 function getConfiguredLinkedInShortcut(shortcutId) {
@@ -10629,31 +10903,183 @@ function getElementLabel(element) {
     .trim();
 }
 
-function getVisibleInviteDecisionDialog() {
-  const candidates = Array.from(document.querySelectorAll("[role='dialog'], .artdeco-modal"));
+function querySelectorAllDeep(root, selector) {
+  if (!root || typeof root.querySelectorAll !== "function" || !selector) {
+    return [];
+  }
+
+  const results = [];
+  const seenRoots = new Set();
+  const seenElements = new Set();
+  const queue = [root];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || seenRoots.has(current) || typeof current.querySelectorAll !== "function") {
+      continue;
+    }
+    seenRoots.add(current);
+
+    if (current instanceof Element && typeof current.matches === "function" && current.matches(selector) && !seenElements.has(current)) {
+      seenElements.add(current);
+      results.push(current);
+    }
+
+    for (const candidate of current.querySelectorAll(selector)) {
+      if (seenElements.has(candidate)) {
+        continue;
+      }
+      seenElements.add(candidate);
+      results.push(candidate);
+    }
+
+    for (const candidate of current.querySelectorAll("*")) {
+      if (candidate?.shadowRoot && !seenRoots.has(candidate.shadowRoot)) {
+        queue.push(candidate.shadowRoot);
+      }
+    }
+  }
+
+  return results;
+}
+
+function isInviteAddNoteLabel(label) {
+  const normalized = normalizeProfileActionLabel(label);
+  return normalized === "add a note" || normalized.startsWith("add a note");
+}
+
+function isInviteSendWithoutNoteLabel(label) {
+  const normalized = normalizeProfileActionLabel(label);
+  return (
+    normalized.includes("send without a note") ||
+    (normalized.includes("send") && normalized.includes("without") && normalized.includes("note"))
+  );
+}
+
+function findVisibleInviteDecisionButtons(root = document) {
+  if (!root || typeof root.querySelectorAll !== "function") {
+    return {
+      addNoteButton: null,
+      sendWithoutNoteButton: null
+    };
+  }
+
+  let addNoteButton = null;
+  let sendWithoutNoteButton = null;
+  const candidates = querySelectorAllDeep(root, "button, a[role='button'], [role='button']");
   for (const candidate of candidates) {
+    if (!isElementVisible(candidate) || isCandidateDisabled(candidate)) {
+      continue;
+    }
+    const label = getElementLabel(candidate);
+    if (!addNoteButton && isInviteAddNoteLabel(label)) {
+      addNoteButton = candidate;
+    }
+    if (!sendWithoutNoteButton && isInviteSendWithoutNoteLabel(label)) {
+      sendWithoutNoteButton = candidate;
+    }
+    if (addNoteButton && sendWithoutNoteButton) {
+      break;
+    }
+  }
+
+  if (!addNoteButton || !sendWithoutNoteButton) {
+    const textCandidates = querySelectorAllDeep(root, "*");
+    for (const candidate of textCandidates) {
+      if (!isElementVisible(candidate)) {
+        continue;
+      }
+      const label = getElementLabel(candidate);
+      const button = candidate.closest("button, a[role='button'], [role='button']");
+      if (!button || !isElementVisible(button) || isCandidateDisabled(button)) {
+        continue;
+      }
+      if (!addNoteButton && isInviteAddNoteLabel(label)) {
+        addNoteButton = button;
+      }
+      if (!sendWithoutNoteButton && isInviteSendWithoutNoteLabel(label)) {
+        sendWithoutNoteButton = button;
+      }
+      if (addNoteButton && sendWithoutNoteButton) {
+        break;
+      }
+    }
+  }
+
+  return {
+    addNoteButton,
+    sendWithoutNoteButton
+  };
+}
+
+function getVisibleInviteDecisionDialogState() {
+  const roots = getInviteDecisionRoots();
+  for (const root of roots) {
+    const buttons = findVisibleInviteDecisionButtons(root);
+    if (buttons.addNoteButton && buttons.sendWithoutNoteButton) {
+      return {
+        dialog: root,
+        ...buttons
+      };
+    }
+  }
+
+  return null;
+}
+
+function getInviteDecisionRoots() {
+  const roots = [];
+  const seen = new Set();
+  const addRoot = (candidate) => {
+    if (!candidate || seen.has(candidate)) {
+      return;
+    }
+    seen.add(candidate);
+    roots.push(candidate);
+  };
+
+  addRoot(document.getElementById("interop-outlet"));
+  addRoot(document.body);
+  addRoot(document.documentElement);
+  for (const candidate of document.querySelectorAll(
+    "#interop-outlet, #interop-outlet *, [role='dialog'], .artdeco-modal, .artdeco-modal__content, .artdeco-modal-overlay, .send-invite"
+  )) {
+    addRoot(candidate);
+  }
+
+  return roots;
+}
+
+function hasVisibleInviteDecisionDialogShell() {
+  const selectors = [
+    "#interop-outlet .artdeco-modal",
+    "#interop-outlet .artdeco-modal-overlay",
+    "#interop-outlet [role='dialog']",
+    ".artdeco-modal.send-invite",
+    ".send-invite"
+  ];
+  for (const candidate of document.querySelectorAll(selectors.join(","))) {
     if (!isElementVisible(candidate)) {
       continue;
     }
-    const text = String(candidate.innerText || candidate.textContent || "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
-    if (!text) {
-      continue;
-    }
-    if (text.includes("add a note to your invitation") && text.includes("send without a note")) {
-      return candidate;
+    const label = getElementLabel(candidate);
+    if (
+      isInviteAddNoteLabel(label) ||
+      isInviteSendWithoutNoteLabel(label) ||
+      label.toLowerCase().includes("invitation") ||
+      label.toLowerCase().includes("invite")
+    ) {
+      return true;
     }
   }
-  return null;
+  return false;
 }
 
 function findInviteDialogButton(dialog, matcher) {
   if (!dialog || typeof matcher !== "function") {
     return null;
   }
-  const candidates = dialog.querySelectorAll("button, a[role='button'], [role='button']");
+  const candidates = querySelectorAllDeep(dialog, "button, a[role='button'], [role='button']");
   for (const candidate of candidates) {
     if (!isElementVisible(candidate) || isCandidateDisabled(candidate)) {
       continue;
@@ -10665,46 +11091,87 @@ function findInviteDialogButton(dialog, matcher) {
   return null;
 }
 
-function handleInviteDecisionShortcut(event) {
-  const dialog = getVisibleInviteDecisionDialog();
-  if (!dialog) {
-    return false;
+function resolveInviteDecisionTargetButton(dialogState, action) {
+  if (!dialogState || !action) {
+    return null;
   }
+  if (action === "send-without-note") {
+    return (
+      dialogState.sendWithoutNoteButton ||
+      findInviteDialogButton(dialogState.dialog, (label) => isInviteSendWithoutNoteLabel(label))
+    );
+  }
+  if (action === "add-note") {
+    return dialogState.addNoteButton || findInviteDialogButton(dialogState.dialog, (label) => isInviteAddNoteLabel(label));
+  }
+  return null;
+}
 
-  let targetButton = null;
+async function waitForInviteDecisionDialogState(
+  timeoutMs = LINKEDIN_INVITE_DECISION_TIMEOUT_MS,
+  pollIntervalMs = LINKEDIN_INVITE_DECISION_POLL_INTERVAL_MS
+) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const dialogState = getVisibleInviteDecisionDialogState();
+    if (dialogState) {
+      return dialogState;
+    }
+    await waitFor(pollIntervalMs);
+  }
+  return null;
+}
+
+function handleInviteDecisionShortcut(event) {
   let action = "";
   let shortcutLabel = "";
   if (isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.INVITE_SEND_WITHOUT_NOTE)) {
-    targetButton = findInviteDialogButton(
-      dialog,
-      (label) =>
-        label.includes("send without a note") ||
-        (label.includes("send") && label.includes("without") && label.includes("note"))
-    );
     action = "send-without-note";
     shortcutLabel = getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.INVITE_SEND_WITHOUT_NOTE);
   } else if (isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.INVITE_ADD_NOTE)) {
-    targetButton = findInviteDialogButton(
-      dialog,
-      (label) => label === "add a note" || label.includes("add a note")
-    );
     action = "add-note";
     shortcutLabel = getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.INVITE_ADD_NOTE);
   } else {
     return false;
   }
 
+  const initialDialogState = getVisibleInviteDecisionDialogState();
+  if (!initialDialogState && !hasVisibleInviteDecisionDialogShell()) {
+    return false;
+  }
+
   event.preventDefault();
   event.stopPropagation();
+  const runId = generateRunId();
 
-  if (!targetButton) {
-    showToast("Could not find invite action button.", true);
-    logEvent({
+  (async () => {
+    const dialogState = initialDialogState || (await waitForInviteDecisionDialogState());
+    const targetButton = resolveInviteDecisionTargetButton(dialogState, action);
+    if (!targetButton) {
+      showToast("Could not find invite action button.", true);
+      await logEvent({
+        source: "extension.content",
+        level: "warn",
+        event: "invite-shortcut.not-found",
+        runId,
+        message: "Invite modal shortcut pressed, but target button was not found.",
+        link: window.location.href,
+        details: {
+          key: String(event.key || ""),
+          action,
+          shortcut: shortcutLabel
+        }
+      }).catch(() => {});
+      return;
+    }
+
+    targetButton.click();
+    showToast(action === "add-note" ? "Add note selected." : "Send without note selected.");
+    await logEvent({
       source: "extension.content",
-      level: "warn",
-      event: "invite-shortcut.not-found",
-      runId: generateRunId(),
-      message: "Invite modal shortcut pressed, but target button was not found.",
+      event: "invite-shortcut.triggered",
+      runId,
+      message: `Triggered invite modal action: ${action}.`,
       link: window.location.href,
       details: {
         key: String(event.key || ""),
@@ -10712,23 +11179,9 @@ function handleInviteDecisionShortcut(event) {
         shortcut: shortcutLabel
       }
     }).catch(() => {});
-    return true;
-  }
-
-  targetButton.click();
-  showToast(action === "add-note" ? "Add note selected." : "Send without note selected.");
-  logEvent({
-    source: "extension.content",
-    event: "invite-shortcut.triggered",
-    runId: generateRunId(),
-    message: `Triggered invite modal action: ${action}.`,
-    link: window.location.href,
-    details: {
-      key: String(event.key || ""),
-      action,
-      shortcut: shortcutLabel
-    }
-  }).catch(() => {});
+  })().catch(() => {
+    showToast("Could not trigger invite action.", true);
+  });
   return true;
 }
 
@@ -10744,6 +11197,19 @@ function isConnectLabel(label) {
     return true;
   }
   return normalized.includes("invite") && normalized.includes("connect");
+}
+
+function isPendingConnectLabel(label) {
+  const normalized = normalizeProfileActionLabel(label);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    normalized === "pending" ||
+    normalized.startsWith("pending ") ||
+    normalized.includes(" withdraw invitation") ||
+    normalized.includes("withdraw invitation sent")
+  );
 }
 
 function normalizeProfileActionLabel(label) {
@@ -10786,12 +11252,7 @@ function isContactInfoLabel(label) {
 
 function isExactEllipsisSeeMoreLabel(label) {
   const normalized = normalizeProfileActionLabel(label);
-  return (
-    normalized === "... see more" ||
-    normalized === "...see more" ||
-    normalized === "… see more" ||
-    normalized === "…see more"
-  );
+  return /^(?:show\s+)?(?:\.\.\.|…)\s*(?:see\s+)?more$/.test(normalized);
 }
 
 function isSendLabel(label) {
@@ -10835,7 +11296,27 @@ function isCandidateDisabled(candidate) {
 }
 
 function getProfileHeadingElement() {
-  return document.querySelector("main h1");
+  const candidates = Array.from(document.querySelectorAll("main h1, h1")).filter((candidate) => {
+    if (!candidate || !isElementVisible(candidate)) {
+      return false;
+    }
+    if (candidate.closest("header, nav, aside, footer")) {
+      return false;
+    }
+    return true;
+  });
+  if (candidates.length === 0) {
+    return document.querySelector("main h1") || document.querySelector("h1");
+  }
+  candidates.sort((left, right) => {
+    const leftRect = left.getBoundingClientRect();
+    const rightRect = right.getBoundingClientRect();
+    if (Math.abs(leftRect.top - rightRect.top) > 1) {
+      return leftRect.top - rightRect.top;
+    }
+    return leftRect.left - rightRect.left;
+  });
+  return candidates[0];
 }
 
 function getProfileHeadingRect(headingElement) {
@@ -10847,7 +11328,14 @@ function getProfileHeadingRect(headingElement) {
 
 function isElementInProfileActionBand(element, headingRect) {
   if (!headingRect) {
-    return true;
+    if (!element?.closest("main")) {
+      return false;
+    }
+    if (element.closest("header, nav, aside, footer")) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.top >= 0 && rect.top <= PROFILE_ACTION_FALLBACK_MAX_TOP;
   }
   const rect = element.getBoundingClientRect();
   const centerY = rect.top + rect.height / 2;
@@ -10964,6 +11452,7 @@ function findVisibleConnectControl(root = document, options = {}) {
     ...options,
     matcher: (label) => isConnectLabel(label),
     selectors: [
+      "a",
       "button",
       "a[role='button']",
       "[role='button']",
@@ -11000,6 +11489,16 @@ function findVisibleMoreControl(root = document, options = {}) {
   return null;
 }
 
+function findVisibleMoreControlAcrossRoots(roots, options = {}) {
+  for (const root of roots) {
+    const match = findVisibleMoreControl(root, options);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
 function getProfileTopCardRoot(headingElement, headingRect) {
   if (!headingElement) {
     return null;
@@ -11016,9 +11515,12 @@ function getProfileTopCardRoot(headingElement, headingRect) {
     if (!node) {
       continue;
     }
-    const rootCandidate = node.closest("section, article, div, main");
-    if (rootCandidate && rootCandidate.contains(headingElement)) {
-      return rootCandidate;
+    let rootCandidate = node.closest("section, article, main") || node.parentElement;
+    while (rootCandidate && rootCandidate !== document.body) {
+      if (rootCandidate.contains(headingElement)) {
+        return rootCandidate;
+      }
+      rootCandidate = rootCandidate.parentElement;
     }
   }
 
@@ -11045,6 +11547,30 @@ function getProfileTopCardRoot(headingElement, headingRect) {
   }
 
   return headingElement.closest("section") || headingElement.parentElement || null;
+}
+
+function getProfileActionSearchRoots(topCardRoot) {
+  const roots = [];
+  const mainRoot = document.querySelector("main");
+  [topCardRoot, mainRoot, document].forEach((candidate) => {
+    if (!candidate || typeof candidate.querySelectorAll !== "function") {
+      return;
+    }
+    if (!roots.includes(candidate)) {
+      roots.push(candidate);
+    }
+  });
+  return roots;
+}
+
+function findVisibleProfileActionControlAcrossRoots(roots, options = {}) {
+  for (const root of roots) {
+    const match = findVisibleProfileActionControl(root, options);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
 }
 
 function getNodeCenter(node) {
@@ -11105,10 +11631,46 @@ function waitFor(milliseconds) {
   });
 }
 
+async function waitForProfileHeading(timeoutMs = 1000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const headingElement = getProfileHeadingElement();
+    const headingRect = getProfileHeadingRect(headingElement);
+    if (headingElement && headingRect) {
+      return {
+        headingElement,
+        headingRect
+      };
+    }
+    await waitFor(50);
+  }
+  return {
+    headingElement: null,
+    headingRect: null
+  };
+}
+
 async function waitForConnectInMenuForControl(moreControl, timeoutMs = 1600) {
   return waitForProfileActionInMenuForControl(moreControl, {
     matcher: (label) => isConnectLabel(label),
     selectors: [
+      "a",
+      "button",
+      "a[role='button']",
+      "[role='button']",
+      "[role='menuitem']",
+      "li[role='menuitem']",
+      ".artdeco-dropdown__item",
+      ".artdeco-dropdown__item-content"
+    ]
+  }, timeoutMs);
+}
+
+async function waitForPendingInMenuForControl(moreControl, timeoutMs = 500) {
+  return waitForProfileActionInMenuForControl(moreControl, {
+    matcher: (label) => isPendingConnectLabel(label),
+    selectors: [
+      "a",
       "button",
       "a[role='button']",
       "[role='button']",
@@ -11139,46 +11701,51 @@ async function waitForProfileActionInMenuForControl(moreControl, findOptions = {
 }
 
 async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.CONNECT)) {
-  const headingElement = getProfileHeadingElement();
-  const headingRect = getProfileHeadingRect(headingElement);
-  if (!headingElement || !headingRect) {
-    showToast("Couldn't find profile actions for this person.", true);
-    await logEvent({
-      source: "extension.content",
-      level: "warn",
-      event: "connect-shortcut.not-found",
-      runId,
-      message: "Could not locate profile heading for current profile.",
-      link: window.location.href,
-      details: {
-        shortcut: shortcutLabel
-      }
-    });
-    return;
-  }
-
-  const topCardRoot = getProfileTopCardRoot(headingElement, headingRect);
-  if (!topCardRoot) {
-    showToast("Couldn't find profile actions for this person.", true);
-    await logEvent({
-      source: "extension.content",
-      level: "warn",
-      event: "connect-shortcut.not-found",
-      runId,
-      message: "Could not resolve top-card action root for current profile.",
-      link: window.location.href,
-      details: {
-        shortcut: shortcutLabel,
-        headingTop: Math.round(headingRect.top),
-        headingBottom: Math.round(headingRect.bottom)
-      }
-    });
-    return;
-  }
-
-  const directConnect = findVisibleConnectControl(topCardRoot, { headingRect });
+  const { headingElement, headingRect } = await waitForProfileHeading();
+  const headingFound = Boolean(headingElement && headingRect);
+  markLastLinkedInActionDiagnosticsForPage({
+    action: "connect",
+    stage: "start",
+    shortcut: shortcutLabel,
+    headingFound,
+    topCardRootFound: false,
+    searchRootCount: 0
+  });
+  const topCardRoot = headingFound ? getProfileTopCardRoot(headingElement, headingRect) : null;
+  const searchRoots = getProfileActionSearchRoots(topCardRoot);
+  markLastLinkedInActionDiagnosticsForPage({
+    action: "connect",
+    stage: headingFound ? "searching" : "searching-no-heading",
+    shortcut: shortcutLabel,
+    headingFound,
+    topCardRootFound: Boolean(topCardRoot),
+    searchRootCount: searchRoots.length
+  });
+  const directConnect = findVisibleProfileActionControlAcrossRoots(searchRoots, {
+    headingRect,
+    matcher: (label) => isConnectLabel(label),
+    selectors: [
+      "a",
+      "button",
+      "a[role='button']",
+      "[role='button']",
+      "[role='menuitem']",
+      "li[role='menuitem']",
+      ".artdeco-dropdown__item",
+      ".artdeco-dropdown__item-content"
+    ]
+  });
   if (directConnect) {
     const clicked = describeElementForLog(directConnect);
+    markLastLinkedInActionDiagnosticsForPage({
+      action: "connect",
+      stage: "clicked-direct",
+      shortcut: shortcutLabel,
+      clicked: clicked.label,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
     directConnect.click();
     showToast("Connect action triggered.");
     await logEvent({
@@ -11196,20 +11763,74 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
     return;
   }
 
-  const moreControl = findVisibleMoreControl(topCardRoot, { headingRect });
+  const pendingConnect = findVisibleProfileActionControlAcrossRoots(searchRoots, {
+    headingRect,
+    matcher: (label) => isPendingConnectLabel(label),
+    selectors: [
+      "a",
+      "button",
+      "a[role='button']",
+      "[role='button']",
+      "[role='menuitem']",
+      "li[role='menuitem']",
+      ".artdeco-dropdown__item",
+      ".artdeco-dropdown__item-content"
+    ]
+  });
+  if (pendingConnect) {
+    const clicked = describeElementForLog(pendingConnect);
+    markLastLinkedInActionDiagnosticsForPage({
+      action: "connect",
+      stage: "already-pending",
+      shortcut: shortcutLabel,
+      clicked: clicked.label,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
+    showToast("Connection request already pending.");
+    await logEvent({
+      source: "extension.content",
+      event: "connect-shortcut.pending",
+      runId,
+      message: `Connect shortcut pressed via ${shortcutLabel}, but the profile is already pending.`,
+      link: window.location.href,
+      details: {
+        shortcut: shortcutLabel,
+        clicked
+      }
+    });
+    return;
+  }
+
+  const moreControl = findVisibleMoreControlAcrossRoots(searchRoots, { headingRect });
   if (!moreControl) {
+    markLastLinkedInActionDiagnosticsForPage({
+      action: "connect",
+      stage: "missing-more",
+      shortcut: shortcutLabel,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
     showToast("Couldn't find a Connect action on this profile.", true);
     await logEvent({
       source: "extension.content",
       level: "warn",
       event: "connect-shortcut.not-found",
       runId,
-      message: "Could not find direct Connect button or More actions menu.",
+      message: topCardRoot
+        ? "Could not find direct Connect button or More actions menu."
+        : headingFound
+          ? "Could not resolve top-card root and document-wide fallback did not find Connect or More."
+          : "Heading was unavailable and fallback action search did not find Connect or More.",
       link: window.location.href,
       details: {
         shortcut: shortcutLabel,
-        headingTop: Math.round(headingRect.top),
-        headingBottom: Math.round(headingRect.bottom)
+        headingFound,
+        topCardRootFound: Boolean(topCardRoot),
+        headingTop: headingRect ? Math.round(headingRect.top) : 0,
+        headingBottom: headingRect ? Math.round(headingRect.bottom) : 0
       }
     });
     return;
@@ -11219,6 +11840,15 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
   const menuConnect = await waitForConnectInMenuForControl(moreControl);
   if (menuConnect) {
     const clicked = describeElementForLog(menuConnect);
+    markLastLinkedInActionDiagnosticsForPage({
+      action: "connect",
+      stage: "clicked-menu",
+      shortcut: shortcutLabel,
+      clicked: clicked.label,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
     menuConnect.click();
     showToast("Connect action triggered.");
     await logEvent({
@@ -11236,6 +11866,41 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
     return;
   }
 
+  const pendingMenuItem = await waitForPendingInMenuForControl(moreControl);
+  if (pendingMenuItem) {
+    const clicked = describeElementForLog(pendingMenuItem);
+    markLastLinkedInActionDiagnosticsForPage({
+      action: "connect",
+      stage: "already-pending",
+      shortcut: shortcutLabel,
+      clicked: clicked.label,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
+    showToast("Connection request already pending.");
+    await logEvent({
+      source: "extension.content",
+      event: "connect-shortcut.pending",
+      runId,
+      message: `Opened More menu via ${shortcutLabel}, but the profile is already pending.`,
+      link: window.location.href,
+      details: {
+        shortcut: shortcutLabel,
+        clicked
+      }
+    });
+    return;
+  }
+
+  markLastLinkedInActionDiagnosticsForPage({
+    action: "connect",
+    stage: "missing-menu-action",
+    shortcut: shortcutLabel,
+    headingFound,
+    topCardRootFound: Boolean(topCardRoot),
+    searchRootCount: searchRoots.length
+  });
   showToast("Opened More menu, but couldn't find Connect.", true);
   await logEvent({
     source: "extension.content",
@@ -11270,52 +11935,42 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
     ".artdeco-dropdown__item",
     ".artdeco-dropdown__item-content"
   ];
-  const headingElement = getProfileHeadingElement();
-  const headingRect = getProfileHeadingRect(headingElement);
-  if (!headingElement || !headingRect) {
-    showToast("Couldn't find profile actions for this person.", true);
-    await logEvent({
-      source: "extension.content",
-      level: "warn",
-      event: "linkedin-profile-shortcut.not-found",
-      runId,
-      message: `Could not locate profile heading while handling ${action}.`,
-      link: window.location.href,
-      details: {
-        action,
-        shortcut
-      }
-    });
-    return;
-  }
-
-  const topCardRoot = getProfileTopCardRoot(headingElement, headingRect);
-  if (!topCardRoot) {
-    showToast("Couldn't find profile actions for this person.", true);
-    await logEvent({
-      source: "extension.content",
-      level: "warn",
-      event: "linkedin-profile-shortcut.not-found",
-      runId,
-      message: `Could not resolve top-card action root while handling ${action}.`,
-      link: window.location.href,
-      details: {
-        action,
-        shortcut,
-        headingTop: Math.round(headingRect.top),
-        headingBottom: Math.round(headingRect.bottom)
-      }
-    });
-    return;
-  }
-
-  const directAction = findVisibleProfileActionControl(topCardRoot, {
+  const { headingElement, headingRect } = await waitForProfileHeading();
+  const headingFound = Boolean(headingElement && headingRect);
+  markLastLinkedInActionDiagnosticsForPage({
+    action,
+    stage: "start",
+    shortcut,
+    headingFound,
+    topCardRootFound: false,
+    searchRootCount: 0
+  });
+  const topCardRoot = headingFound ? getProfileTopCardRoot(headingElement, headingRect) : null;
+  const searchRoots = getProfileActionSearchRoots(topCardRoot);
+  markLastLinkedInActionDiagnosticsForPage({
+    action,
+    stage: headingFound ? "searching" : "searching-no-heading",
+    shortcut,
+    headingFound,
+    topCardRootFound: Boolean(topCardRoot),
+    searchRootCount: searchRoots.length
+  });
+  const directAction = findVisibleProfileActionControlAcrossRoots(searchRoots, {
     headingRect,
     matcher,
     selectors
   });
   if (directAction) {
     const clicked = describeElementForLog(directAction);
+    markLastLinkedInActionDiagnosticsForPage({
+      action,
+      stage: "clicked-direct",
+      shortcut,
+      clicked: clicked.label,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
     directAction.click();
     showToast(successToast);
     await logEvent({
@@ -11334,21 +11989,35 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
     return;
   }
 
-  const moreControl = findVisibleMoreControl(topCardRoot, { headingRect });
+  const moreControl = findVisibleMoreControlAcrossRoots(searchRoots, { headingRect });
   if (!moreControl) {
+    markLastLinkedInActionDiagnosticsForPage({
+      action,
+      stage: "missing-more",
+      shortcut,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
     showToast(notFoundToast, true);
     await logEvent({
       source: "extension.content",
       level: "warn",
       event: "linkedin-profile-shortcut.not-found",
       runId,
-      message: `Could not find direct action or More menu for "${action}".`,
+      message: topCardRoot
+        ? `Could not find direct action or More menu for "${action}".`
+        : headingFound
+          ? `Could not resolve top-card root and document-wide fallback did not find "${action}" or More.`
+          : `Heading was unavailable and fallback action search did not find "${action}" or More.`,
       link: window.location.href,
       details: {
         action,
         shortcut,
-        headingTop: Math.round(headingRect.top),
-        headingBottom: Math.round(headingRect.bottom)
+        headingFound,
+        topCardRootFound: Boolean(topCardRoot),
+        headingTop: headingRect ? Math.round(headingRect.top) : 0,
+        headingBottom: headingRect ? Math.round(headingRect.bottom) : 0
       }
     });
     return;
@@ -11365,6 +12034,15 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
   );
   if (menuAction) {
     const clicked = describeElementForLog(menuAction);
+    markLastLinkedInActionDiagnosticsForPage({
+      action,
+      stage: "clicked-menu",
+      shortcut,
+      clicked: clicked.label,
+      headingFound,
+      topCardRootFound: Boolean(topCardRoot),
+      searchRootCount: searchRoots.length
+    });
     menuAction.click();
     showToast(successToast);
     await logEvent({
@@ -11383,6 +12061,14 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
     return;
   }
 
+  markLastLinkedInActionDiagnosticsForPage({
+    action,
+    stage: "missing-menu-action",
+    shortcut,
+    headingFound,
+    topCardRootFound: Boolean(topCardRoot),
+    searchRootCount: searchRoots.length
+  });
   showToast(notFoundToast, true);
   await logEvent({
     source: "extension.content",
@@ -11578,12 +12264,12 @@ async function triggerExpandEllipsisMoreShortcut(
 
   if (clickedCount > 0) {
     const noun = clickedCount === 1 ? "control" : "controls";
-    showToast(`Expanded ${clickedCount} "... see more" ${noun}.`);
+    showToast(`Expanded ${clickedCount} "... more" ${noun}.`);
     await logEvent({
       source: "extension.content",
       event: "linkedin-profile-shortcut.triggered",
       runId,
-      message: `Expanded ${clickedCount} "... see more" controls via ${shortcutLabel}.`,
+      message: `Expanded ${clickedCount} "... more" controls via ${shortcutLabel}.`,
       link: window.location.href,
       details: {
         action: "expand-ellipsis-see-more",
@@ -11595,13 +12281,13 @@ async function triggerExpandEllipsisMoreShortcut(
     return;
   }
 
-  showToast('No "... see more" controls found to expand.', true);
+  showToast('No "... more" controls found to expand.', true);
   await logEvent({
     source: "extension.content",
     level: "warn",
     event: "linkedin-profile-shortcut.not-found",
     runId,
-    message: 'Shortcut pressed but no exact "... see more" controls were found.',
+    message: 'Shortcut pressed but no exact "... more" controls were found.',
     link: window.location.href,
     details: {
       action: "expand-ellipsis-see-more",
@@ -11885,15 +12571,41 @@ function onKeyDown(event) {
   const isLinkedInPublicContext = isLinkedInPublicProfilePage();
   const isLinkedInRecruiterContext = isLinkedInRecruiterProfilePage();
   const isModifierBasedShortcut = Boolean(event.metaKey || event.ctrlKey || event.altKey);
-  if (isEditableElement(event.target) && !isModifierBasedShortcut) {
+  const editableTarget = isEditableElement(event.target);
+  const actualShortcut = normalizeShortcut(keyboardEventToShortcut(event));
+  const updateShortcutDiagnostics = (match = "") => {
+    markLastShortcutDiagnosticsForPage({
+      shortcut: actualShortcut,
+      key: event.key,
+      code: event.code,
+      target: event.target?.tagName || "",
+      supported: supportedPage,
+      linkedin: isLinkedInContext,
+      linkedinPublic: isLinkedInPublicContext,
+      linkedinRecruiter: isLinkedInRecruiterContext,
+      editable: editableTarget,
+      match
+    });
+  };
+
+  updateShortcutDiagnostics();
+
+  if (editableTarget && !isModifierBasedShortcut) {
+    updateShortcutDiagnostics("blocked:editable-no-modifier");
     return;
   }
 
   if (supportedPage && isLinkedInContext && handleInviteDecisionShortcut(event)) {
+    updateShortcutDiagnostics("inviteDecision");
     return;
   }
 
   if (supportedPage && isLinkedInContext && isCycleGemStatusDisplayModeShortcut(event)) {
+    updateShortcutDiagnostics("cycleGemStatusDisplayMode");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "cycleGemStatusDisplayMode",
+      shortcut: getConfiguredShortcutLabel(GEM_STATUS_DISPLAY_MODE_SHORTCUT_ID)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -11916,6 +12628,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInContext && isConnectShortcut(event)) {
+    updateShortcutDiagnostics("connect");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "connect",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.CONNECT)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -11938,6 +12655,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInPublicContext && isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.VIEW_IN_RECRUITER)) {
+    updateShortcutDiagnostics("viewInRecruiter");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "viewInRecruiter",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.VIEW_IN_RECRUITER)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -11961,6 +12683,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInPublicContext && isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.MESSAGE_PROFILE)) {
+    updateShortcutDiagnostics("message");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "message",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.MESSAGE_PROFILE)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -11984,6 +12711,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInPublicContext && isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.CONTACT_INFO)) {
+    updateShortcutDiagnostics("contactInfo");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "contactInfo",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.CONTACT_INFO)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -12007,6 +12739,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInPublicContext && isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.EXPAND_SEE_MORE)) {
+    updateShortcutDiagnostics("expandSeeMore");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "expandSeeMore",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.EXPAND_SEE_MORE)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -12030,6 +12767,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInRecruiterContext && isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.RECRUITER_TEMPLATE)) {
+    updateShortcutDiagnostics("recruiterTemplate");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "recruiterTemplate",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.RECRUITER_TEMPLATE)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -12053,6 +12795,11 @@ function onKeyDown(event) {
   }
 
   if (supportedPage && isLinkedInRecruiterContext && isConfiguredLinkedInShortcut(event, LINKEDIN_SHORTCUT_IDS.RECRUITER_SEND)) {
+    updateShortcutDiagnostics("recruiterSend");
+    debugContentRuntime("linkedin-shortcut-matched", {
+      action: "recruiterSend",
+      shortcut: getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.RECRUITER_SEND)
+    });
     event.preventDefault();
     event.stopPropagation();
     const runId = generateRunId();
@@ -12076,21 +12823,26 @@ function onKeyDown(event) {
   }
 
   if (!cachedSettings) {
+    updateShortcutDiagnostics("blocked:no-settings");
     return;
   }
 
   const shortcut = keyboardEventToShortcut(event);
   if (!shortcut) {
+    updateShortcutDiagnostics("blocked:no-shortcut");
     return;
   }
   const actionId = findActionByShortcut(shortcut);
   if (!actionId) {
+    updateShortcutDiagnostics("blocked:no-action");
     return;
   }
   if (actionId !== ACTIONS.GEM_ACTIONS && !supportedPage) {
+    updateShortcutDiagnostics("blocked:unsupported-page");
     return;
   }
 
+  updateShortcutDiagnostics(`action:${actionId}`);
   event.preventDefault();
   event.stopPropagation();
   const runId = generateRunId();
@@ -12109,10 +12861,20 @@ function onKeyDown(event) {
 }
 
 async function init() {
+  markContentRuntimeReadyForPage();
+  markConfiguredShortcutDiagnosticsForPage();
+  if (isLinkedInProfilePage()) {
+    debugContentRuntime("linkedin-content-runtime-ready", {
+      version: CONTENT_RUNTIME_VERSION
+    });
+  }
   const bootstrapManagedLinkedIn = isBootstrapManagedLinkedInPage();
   if (!isLinkedInProfilePage()) {
     window.addEventListener("keydown", onKeyDown, true);
+    markContentShortcutListenerReadyForPage("global");
   } else if (!bootstrapManagedLinkedIn) {
+    window.addEventListener("keydown", onKeyDown, true);
+    markContentShortcutListenerReadyForPage("linkedin-direct");
     bindLinkedInPageChangeWatcher();
   }
   if (!bootstrapManagedLinkedIn) {
@@ -12181,6 +12943,7 @@ async function init() {
   chrome.storage.onChanged.addListener((changes, namespace) => {
     if (namespace === "sync" && changes.settings) {
       cachedSettings = deepMerge(DEFAULT_SETTINGS, changes.settings.newValue || {});
+      markConfiguredShortcutDiagnosticsForPage();
       if (bootstrapManagedLinkedIn && isLinkedInProfilePage()) {
         return;
       }
@@ -12200,6 +12963,7 @@ async function init() {
 
   try {
     await refreshSettings();
+    markConfiguredShortcutDiagnosticsForPage();
   } catch (error) {
     if (isContextInvalidatedError(error?.message || "")) {
       triggerContextRecovery(error.message);
@@ -12211,6 +12975,7 @@ async function init() {
     setTimeout(() => {
       refreshSettings()
         .then(() => {
+          markConfiguredShortcutDiagnosticsForPage();
           if (bootstrapManagedLinkedIn && isLinkedInProfilePage()) {
             return;
           }
@@ -12351,6 +13116,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         gemProfileUrl: String(context?.gemProfileUrl || "").trim(),
         linkedinUrl: String(context?.linkedinUrl || "").trim(),
         linkedInHandle: String(context?.linkedInHandle || "").trim(),
+        gmailSubject: String(context?.gmailSubject || "").trim(),
         contactEmail: String(context?.contactEmail || "").trim(),
         contactEmailCount: Array.isArray(context?.contactEmails) ? context.contactEmails.length : 0,
         gmailThreadToken: String(context?.gmailThreadToken || "").trim()

@@ -1,7 +1,7 @@
 "use strict";
 
 globalThis.__GLS_SHARED_RUNTIME_READY__ = true;
-const CONTENT_RUNTIME_VERSION = "2026-03-23-8";
+const CONTENT_RUNTIME_VERSION = "2026-03-25-1";
 
 const ACTIONS = {
   GEM_ACTIONS: "gemActions",
@@ -86,6 +86,9 @@ const DEFAULT_SETTINGS = {
     cycleGemStatusDisplayMode: "Cmd+Control+Option+S"
   }
 };
+
+let cachedKeyboardLayoutMap = null;
+let keyboardLayoutMapPromise = null;
 
 function normalizeGemStatusDisplayMode(rawValue, fallbackEnabled = true) {
   const value = String(rawValue || "").trim();
@@ -221,7 +224,28 @@ function normalizeShortcut(raw) {
   return ordered.join("+");
 }
 
-function getEventKeyToken(event) {
+function canUseKeyboardLayoutMap() {
+  return Boolean(typeof navigator !== "undefined" && navigator?.keyboard && typeof navigator.keyboard.getLayoutMap === "function");
+}
+
+function normalizeKeyboardToken(value) {
+  const key = String(value || "");
+  if (!key) {
+    return "";
+  }
+  if (key === " ") {
+    return "Space";
+  }
+  if (key === "Esc") {
+    return "Escape";
+  }
+  if (key.length === 1) {
+    return /[a-z]/i.test(key) ? key.toUpperCase() : key;
+  }
+  return key;
+}
+
+function getPhysicalCodeToken(event) {
   const code = event.code || "";
   if (/^Key[A-Z]$/.test(code)) {
     return code.slice(3);
@@ -238,21 +262,79 @@ function getEventKeyToken(event) {
   if (/^F([1-9]|1[0-2])$/.test(code)) {
     return code;
   }
-
-  let key = event.key || "";
-  if (key === " ") {
-    return "Space";
-  }
-  if (key.length === 1) {
-    return key.toUpperCase();
-  }
-  if (key === "Esc") {
-    return "Escape";
-  }
-  return key;
+  return "";
 }
 
-function keyboardEventToShortcut(event) {
+function getLogicalEventKeyToken(event) {
+  return normalizeKeyboardToken(event?.key || "");
+}
+
+function getKeyboardLayoutMapToken(event) {
+  if (!cachedKeyboardLayoutMap || typeof cachedKeyboardLayoutMap.get !== "function") {
+    return "";
+  }
+  const code = String(event?.code || "");
+  if (!code) {
+    return "";
+  }
+  if (code === "Space") {
+    return "Space";
+  }
+  if (/^Arrow(Up|Down|Left|Right)$/.test(code) || /^F([1-9]|1[0-2])$/.test(code)) {
+    return code;
+  }
+  return normalizeKeyboardToken(cachedKeyboardLayoutMap.get(code));
+}
+
+function ensureKeyboardLayoutMapLoaded() {
+  if (cachedKeyboardLayoutMap) {
+    return Promise.resolve(cachedKeyboardLayoutMap);
+  }
+  if (keyboardLayoutMapPromise) {
+    return keyboardLayoutMapPromise;
+  }
+  if (!canUseKeyboardLayoutMap()) {
+    return Promise.resolve(null);
+  }
+  keyboardLayoutMapPromise = Promise.resolve()
+    .then(() => navigator.keyboard.getLayoutMap())
+    .then((layoutMap) => {
+      cachedKeyboardLayoutMap = layoutMap || null;
+      return cachedKeyboardLayoutMap;
+    })
+    .catch(() => null)
+    .finally(() => {
+      keyboardLayoutMapPromise = null;
+    });
+  return keyboardLayoutMapPromise;
+}
+
+function getEventKeyToken(event, options = {}) {
+  const preferLegacyCode = Boolean(options.preferLegacyCode);
+  const physicalToken = getPhysicalCodeToken(event);
+  const logicalToken = getLogicalEventKeyToken(event);
+  if (preferLegacyCode) {
+    return physicalToken || logicalToken;
+  }
+
+  const layoutToken = getKeyboardLayoutMapToken(event);
+  if (layoutToken) {
+    return layoutToken;
+  }
+
+  if (logicalToken && logicalToken !== "Dead" && logicalToken !== "Unidentified") {
+    if (!event?.altKey) {
+      return logicalToken;
+    }
+    if (/^[A-Z0-9]$/.test(logicalToken) || logicalToken === "Space" || /^Arrow/.test(logicalToken) || /^F\d+$/.test(logicalToken)) {
+      return logicalToken;
+    }
+  }
+
+  return physicalToken || logicalToken;
+}
+
+function keyboardEventToShortcut(event, options = {}) {
   const ordered = [];
   if (event.metaKey) {
     ordered.push("Meta");
@@ -267,7 +349,7 @@ function keyboardEventToShortcut(event) {
     ordered.push("Alt");
   }
 
-  const key = getEventKeyToken(event);
+  const key = getEventKeyToken(event, options);
   if (key && !["Control", "Alt", "Shift", "Meta"].includes(key)) {
     ordered.push(key);
   }
@@ -278,6 +360,8 @@ function keyboardEventToShortcut(event) {
 
   return ordered.join("+");
 }
+
+ensureKeyboardLayoutMapLoaded();
 
 function shortcutHasModifier(shortcut) {
   const normalized = normalizeShortcut(shortcut);
