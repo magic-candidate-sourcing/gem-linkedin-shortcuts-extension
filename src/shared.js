@@ -154,7 +154,7 @@ let keyboardLayoutMapPromise = null;
 
 function normalizeGemStatusDisplayMode(rawValue, fallbackEnabled = true) {
   const value = String(rawValue || "").trim();
-  if (value === "frameAndStatus" || value === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY) {
+  if (value === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY) {
     return GEM_STATUS_DISPLAY_MODES.STATUS_ONLY;
   }
   if (value === GEM_STATUS_DISPLAY_MODES.OFF) {
@@ -168,11 +168,7 @@ function normalizeGemStatusDisplayMode(rawValue, fallbackEnabled = true) {
 
 function getGemStatusDisplayModeFromSettings(settings = {}, fallbackEnabled = true) {
   const baseline = isPlainObject(settings) ? settings : {};
-  const hasExplicitMode = Object.prototype.hasOwnProperty.call(baseline, "gemStatusDisplayMode");
-  const legacyFallbackEnabled = Object.prototype.hasOwnProperty.call(baseline, "showGemStatusBadge")
-    ? baseline.showGemStatusBadge !== false
-    : fallbackEnabled;
-  return normalizeGemStatusDisplayMode(hasExplicitMode ? baseline.gemStatusDisplayMode : undefined, legacyFallbackEnabled);
+  return normalizeGemStatusDisplayMode(baseline.gemStatusDisplayMode, fallbackEnabled);
 }
 
 function isGemStatusDisplayEnabled(mode, fallbackEnabled = true) {
@@ -508,6 +504,86 @@ function glsIsLinkedInHost(hostname) {
 
 function glsIsLinkedInPublicProfilePath(pathname) {
   return /^\/(?:in|pub)\/[^/]+(?:\/.*)?$/.test(String(pathname || ""));
+}
+
+function glsIsLinkedInRecruiterProfilePath(pathname) {
+  return /^\/talent\/(?:.*\/)?profile\/[^/]+(?:\/.*)?$/i.test(String(pathname || ""));
+}
+
+function glsIsLinkedInProfilePath(pathname) {
+  return glsIsLinkedInPublicProfilePath(pathname) || glsIsLinkedInRecruiterProfilePath(pathname);
+}
+
+function glsNormalizeUrl(url = globalThis.location?.href || "", options = {}) {
+  const keepHash = Boolean(options.keepHash);
+  const keepSearch = Boolean(options.keepSearch);
+  const stripTrailingSlash = options.stripTrailingSlash !== false;
+  const urlBase = options.urlBase || globalThis.location?.origin;
+  const fallback = String(url || "").trim();
+  if (!fallback) {
+    return "";
+  }
+  try {
+    const parsed = urlBase ? new URL(fallback, urlBase) : new URL(fallback);
+    if (!keepSearch) {
+      parsed.search = "";
+    }
+    if (!keepHash) {
+      parsed.hash = "";
+    }
+    const normalized = parsed.toString();
+    return stripTrailingSlash ? normalized.replace(/\/$/, "") : normalized;
+  } catch (_error) {
+    let normalized = fallback;
+    if (!keepSearch) {
+      normalized = normalized.replace(/\?.*$/, "");
+    }
+    if (!keepHash) {
+      normalized = normalized.replace(/#.*$/, "");
+    }
+    return stripTrailingSlash ? normalized.replace(/\/$/, "") : normalized;
+  }
+}
+
+function glsNormalizePageUrl(url = globalThis.location?.href || "", options = {}) {
+  return glsNormalizeUrl(url, {
+    ...options,
+    keepSearch: options.keepSearch !== false,
+    keepHash: false,
+    stripTrailingSlash: false
+  });
+}
+
+function glsIsLinkedInProfilePage(url = globalThis.location?.href || "") {
+  const fallback = String(url || "");
+  try {
+    const parsed = new URL(fallback, globalThis.location?.origin);
+    return glsIsLinkedInHost(parsed.hostname) && glsIsLinkedInProfilePath(parsed.pathname);
+  } catch (_error) {
+    return /^https:\/\/www\.linkedin\.com\/(?:(?:in|pub)\/[^/]+|talent\/(?:.*\/)?profile\/[^/]+)(?:\/.*)?$/i.test(
+      fallback
+    );
+  }
+}
+
+function glsIsLinkedInPublicProfilePage(url = globalThis.location?.href || "") {
+  const fallback = String(url || "");
+  try {
+    const parsed = new URL(fallback, globalThis.location?.origin);
+    return glsIsLinkedInHost(parsed.hostname) && glsIsLinkedInPublicProfilePath(parsed.pathname);
+  } catch (_error) {
+    return /^https:\/\/www\.linkedin\.com\/(?:in|pub)\/[^/]+(?:\/.*)?$/i.test(fallback);
+  }
+}
+
+function glsIsLinkedInRecruiterProfilePage(url = globalThis.location?.href || "") {
+  const fallback = String(url || "");
+  try {
+    const parsed = new URL(fallback, globalThis.location?.origin);
+    return glsIsLinkedInHost(parsed.hostname) && glsIsLinkedInRecruiterProfilePath(parsed.pathname);
+  } catch (_error) {
+    return /^https:\/\/www\.linkedin\.com\/talent\/(?:.*\/)?profile\/[^/]+(?:\/.*)?$/i.test(fallback);
+  }
 }
 
 function glsNormalizeLinkedInIdentifier(value) {

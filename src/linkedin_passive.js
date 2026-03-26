@@ -5,6 +5,18 @@
     return;
   }
 
+  if (
+    typeof deepMerge !== "function" ||
+    typeof DEFAULT_SETTINGS === "undefined" ||
+    typeof glsNormalizeUrl !== "function" ||
+    typeof glsNormalizePageUrl !== "function" ||
+    typeof glsIsLinkedInProfilePage !== "function" ||
+    typeof glsIsLinkedInPublicProfilePage !== "function" ||
+    typeof glsIsLinkedInRecruiterProfilePage !== "function"
+  ) {
+    throw new Error("[GLS] shared.js must load before linkedin_passive.js");
+  }
+
   const VISIBLE_REFRESH_MS = 60 * 1000;
   const PAGE_CHANGE_REFRESH_DELAY_MS = 700;
   const FOCUS_REFRESH_DELAY_MS = 220;
@@ -37,91 +49,15 @@
   function normalizeSettings(settings) {
     if (typeof deepMerge === "function" && typeof DEFAULT_SETTINGS !== "undefined") {
       const normalized = deepMerge(DEFAULT_SETTINGS, settings || {});
-      const { showGemStatusBadge: _legacyShowGemStatusBadge, ...rest } = normalized;
       return {
-        ...rest,
+        ...normalized,
         gemStatusDisplayMode:
           typeof getGemStatusDisplayModeFromSettings === "function"
-            ? getGemStatusDisplayModeFromSettings(settings, true)
+            ? getGemStatusDisplayModeFromSettings(normalized, true)
             : String(normalized.gemStatusDisplayMode || "")
       };
     }
     return settings && typeof settings === "object" ? { ...settings } : {};
-  }
-
-  function normalizeUrl(url, options = {}) {
-    const fallback = String(url || "").trim();
-    if (!fallback) {
-      return "";
-    }
-    try {
-      const parsed = new URL(fallback, window.location.origin);
-      if (!options.keepSearch) {
-        parsed.search = "";
-      }
-      if (!options.keepHash) {
-        parsed.hash = "";
-      }
-      return parsed.toString().replace(/\/$/, "");
-    } catch (_error) {
-      let normalized = fallback;
-      if (!options.keepSearch) {
-        normalized = normalized.replace(/\?.*$/, "");
-      }
-      if (!options.keepHash) {
-        normalized = normalized.replace(/#.*$/, "");
-      }
-      return normalized.replace(/\/$/, "");
-    }
-  }
-
-  function normalizePageUrl(url = window.location.href) {
-    try {
-      const parsed = new URL(url, window.location.origin);
-      parsed.hash = "";
-      return parsed.toString();
-    } catch (_error) {
-      return String(url || "");
-    }
-  }
-
-  function isLinkedInHost(hostname) {
-    return /(^|\.)linkedin\.com$/i.test(String(hostname || ""));
-  }
-
-  function isLinkedInPublicProfilePath(pathname) {
-    return /^\/(?:in|pub)\/[^/]+(?:\/.*)?$/.test(String(pathname || ""));
-  }
-
-  function isLinkedInRecruiterProfilePath(pathname) {
-    return /^\/talent\/(?:.*\/)?profile\/[^/]+(?:\/.*)?$/i.test(String(pathname || ""));
-  }
-
-  function isLinkedInProfilePage() {
-    try {
-      const parsed = new URL(window.location.href);
-      return isLinkedInHost(parsed.hostname) && (isLinkedInPublicProfilePath(parsed.pathname) || isLinkedInRecruiterProfilePath(parsed.pathname));
-    } catch (_error) {
-      return false;
-    }
-  }
-
-  function isLinkedInPublicProfilePage() {
-    try {
-      const parsed = new URL(window.location.href);
-      return isLinkedInHost(parsed.hostname) && isLinkedInPublicProfilePath(parsed.pathname);
-    } catch (_error) {
-      return false;
-    }
-  }
-
-  function isLinkedInRecruiterProfilePage() {
-    try {
-      const parsed = new URL(window.location.href);
-      return isLinkedInHost(parsed.hostname) && isLinkedInRecruiterProfilePath(parsed.pathname);
-    } catch (_error) {
-      return false;
-    }
   }
 
   function getLinkedInIdentityHelpers() {
@@ -139,16 +75,6 @@
   function getProfileName() {
     const heading = document.querySelector("h1");
     return heading ? String(heading.textContent || "").trim() : "";
-  }
-
-  function findLinkedInPublicProfileUrlInInlineScripts() {
-    return getLinkedInIdentityHelpers().findLinkedInPublicProfileUrlInInlineScripts?.({
-      document,
-      urlBase: window.location.origin,
-      maxScriptTextLength: INLINE_SCRIPT_MAX_TEXT_LENGTH,
-      maxScriptCount: INLINE_SCRIPT_MAX_COUNT,
-      requireSignalPattern: true
-    }) || "";
   }
 
   function findLinkedInPublicProfileUrlInDom(options = {}) {
@@ -169,12 +95,14 @@
   }
 
   function buildLinkedInContext(options = {}) {
-    const pageUrl = normalizePageUrl(window.location.href);
-    const profileUrl = normalizeUrl(window.location.href);
-    const currentPublicUrl = isLinkedInPublicProfilePage() ? toCanonicalLinkedInPublicProfileUrl(window.location.href) : "";
+    const pageUrl = glsNormalizePageUrl(window.location.href);
+    const profileUrl = glsNormalizeUrl(window.location.href);
+    const currentPublicUrl = glsIsLinkedInPublicProfilePage()
+      ? toCanonicalLinkedInPublicProfileUrl(window.location.href)
+      : "";
     let linkedinUrl = currentPublicUrl;
 
-    if (!linkedinUrl && isLinkedInRecruiterProfilePage()) {
+    if (!linkedinUrl && glsIsLinkedInRecruiterProfilePage()) {
       linkedinUrl = findLinkedInPublicProfileUrlInDom({
         allowInlineScript: Boolean(options.allowInlineScript),
         allowAnchorScan: options.allowAnchorScan !== false
@@ -234,7 +162,7 @@
 
   function resetContextCache() {
     state.contextCache = {
-      pageUrl: normalizePageUrl(window.location.href),
+      pageUrl: glsNormalizePageUrl(window.location.href),
       context: null,
       inlineScriptScanned: false
     };
@@ -243,7 +171,7 @@
   }
 
   function scheduleIdentityRetry() {
-    if (!isLinkedInRecruiterProfilePage() || state.identityRetryTimerId) {
+    if (!glsIsLinkedInRecruiterProfilePage() || state.identityRetryTimerId) {
       return false;
     }
     const retryDelayMs = IDENTITY_RETRY_DELAYS_MS[state.identityRetryAttempt];
@@ -271,13 +199,15 @@
   }
 
   function resolveLinkedInContext(options = {}) {
-    const pageUrl = normalizePageUrl(window.location.href);
+    const pageUrl = glsNormalizePageUrl(window.location.href);
     if (state.contextCache.pageUrl !== pageUrl) {
       resetContextCache();
     }
 
     const shouldAttemptInlineScript =
-      isLinkedInRecruiterProfilePage() && Boolean(options.allowInlineScript) && !state.contextCache.inlineScriptScanned;
+      glsIsLinkedInRecruiterProfilePage() &&
+      Boolean(options.allowInlineScript) &&
+      !state.contextCache.inlineScriptScanned;
     const context = buildLinkedInContext({
       allowInlineScript: shouldAttemptInlineScript,
       allowAnchorScan: options.allowAnchorScan !== false
@@ -292,7 +222,7 @@
     if (contextHasIdentity(context)) {
       state.identityRetryAttempt = 0;
       clearIdentityRetryTimer();
-    } else if (isLinkedInRecruiterProfilePage() && options.scheduleRetry !== false) {
+    } else if (glsIsLinkedInRecruiterProfilePage() && options.scheduleRetry !== false) {
       scheduleIdentityRetry();
     }
 
@@ -884,7 +814,7 @@
   }
 
   async function refreshStatus(options = {}) {
-    if (!isLinkedInProfilePage()) {
+    if (!glsIsLinkedInProfilePage()) {
       invalidatePendingRefreshRequests();
       clearPendingWork();
       hideIndicator();
@@ -993,7 +923,7 @@
     clearPendingWork();
     resetContextCache();
     hideIndicator();
-    if (!isLinkedInProfilePage()) {
+    if (!glsIsLinkedInProfilePage()) {
       return;
     }
     scheduleDeferredRefresh(

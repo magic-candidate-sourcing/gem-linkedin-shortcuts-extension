@@ -93,6 +93,77 @@ function invalidateSettingsCache() {
   cachedSettingsPromise = null;
 }
 
+function persistSettingsWithoutValidation(settings) {
+  const normalized = normalizeSettings(settings);
+  setSettingsCache(normalized);
+  return new Promise((resolve) => {
+    chrome.storage.sync.set({ settings: normalized }, () => resolve(normalized));
+  });
+}
+
+function getLegacyGemStatusDisplayModeFromSettings(settings = {}, fallbackEnabled = true) {
+  const baseline = isPlainObject(settings) ? settings : {};
+  const hasExplicitMode = Object.prototype.hasOwnProperty.call(baseline, "gemStatusDisplayMode");
+  const rawMode = hasExplicitMode ? baseline.gemStatusDisplayMode : undefined;
+  const rawValue = String(rawMode || "").trim();
+  if (rawValue === GEM_STATUS_DISPLAY_MODES.STATUS_ONLY || rawValue === "frameAndStatus") {
+    return GEM_STATUS_DISPLAY_MODES.STATUS_ONLY;
+  }
+  if (rawValue === GEM_STATUS_DISPLAY_MODES.OFF || rawMode === false) {
+    return GEM_STATUS_DISPLAY_MODES.OFF;
+  }
+  if (Object.prototype.hasOwnProperty.call(baseline, "showGemStatusBadge")) {
+    return baseline.showGemStatusBadge === false ? GEM_STATUS_DISPLAY_MODES.OFF : GEM_STATUS_DISPLAY_MODES.STATUS_ONLY;
+  }
+  return fallbackEnabled ? GEM_STATUS_DISPLAY_MODES.STATUS_ONLY : GEM_STATUS_DISPLAY_MODES.OFF;
+}
+
+function needsLegacyGemStatusSettingsMigration(settings) {
+  if (!isPlainObject(settings)) {
+    return false;
+  }
+  if (Object.prototype.hasOwnProperty.call(settings, "showGemStatusBadge")) {
+    return true;
+  }
+  if (!Object.prototype.hasOwnProperty.call(settings, "gemStatusDisplayMode")) {
+    return false;
+  }
+  const rawMode = settings.gemStatusDisplayMode;
+  return rawMode !== normalizeGemStatusDisplayMode(rawMode, true);
+}
+
+function migrateLegacyGemStatusSettings(settings) {
+  const baseline = isPlainObject(settings) ? settings : {};
+  if (!needsLegacyGemStatusSettingsMigration(baseline)) {
+    return normalizeSettings(baseline);
+  }
+  const { showGemStatusBadge: _legacyShowGemStatusBadge, ...rest } = baseline;
+  return normalizeSettings({
+    ...rest,
+    gemStatusDisplayMode: getLegacyGemStatusDisplayModeFromSettings(baseline, true)
+  });
+}
+
+async function getCanonicalStoredSyncSettings() {
+  const stored = await getStoredSyncSettings();
+  const rawSettings = isPlainObject(stored) ? stored : {};
+  if (!needsLegacyGemStatusSettingsMigration(rawSettings)) {
+    return {
+      rawSettings,
+      settings: normalizeSettings(rawSettings),
+      migrated: false
+    };
+  }
+
+  const migratedSettings = migrateLegacyGemStatusSettings(rawSettings);
+  await persistSettingsWithoutValidation(migratedSettings);
+  return {
+    rawSettings,
+    settings: migratedSettings,
+    migrated: true
+  };
+}
+
 function generateId() {
   if (crypto && crypto.randomUUID) {
     return crypto.randomUUID();
@@ -136,12 +207,9 @@ async function getSettings() {
     return cloneSettingsForReturn(cachedSettingsValue);
   }
   if (!cachedSettingsPromise) {
-    cachedSettingsPromise = new Promise((resolve) => {
-      chrome.storage.sync.get("settings", (data) => {
-        const normalized = normalizeSettings(data.settings || {});
-        cachedSettingsValue = normalized;
-        resolve(normalized);
-      });
+    cachedSettingsPromise = getCanonicalStoredSyncSettings().then(({ settings }) => {
+      cachedSettingsValue = settings;
+      return settings;
     });
   }
   const settings = await cachedSettingsPromise;
@@ -324,9 +392,7 @@ async function bootstrapOrgDefaults(reason = "runtime") {
   if (!orgDefaults) {
     return { applied: false, reason: "missing_or_invalid_defaults_file" };
   }
-  const stored = await getStoredSyncSettings();
-  const storedSettings = stored && typeof stored === "object" ? stored : {};
-  const current = normalizeSettings(storedSettings);
+  const { rawSettings: storedSettings, settings: current } = await getCanonicalStoredSyncSettings();
   const merged = mergeSettingsWithOrgDefaults(current, orgDefaults, storedSettings);
   if (!merged.changed) {
     return { applied: false, reason: "already_configured" };
@@ -376,13 +442,12 @@ function ensureOrgDefaultsBootstrapped(reason = "runtime") {
 
 function normalizeSettings(input) {
   const merged = deepMerge(DEFAULT_SETTINGS, input || {});
-  const rawInput = input && typeof input === "object" ? input : {};
   const normalizedShortcuts = {};
   for (const key of SHORTCUT_IDS) {
     normalizedShortcuts[key] = normalizeShortcut(merged.shortcuts?.[key] || DEFAULT_SHORTCUTS[key]);
   }
   const { showGemStatusBadge: _legacyShowGemStatusBadge, ...rest } = merged;
-  const normalizedGemStatusDisplayMode = getGemStatusDisplayModeFromSettings(rawInput, true);
+  const normalizedGemStatusDisplayMode = getGemStatusDisplayModeFromSettings(merged, true);
   return {
     ...rest,
     gemStatusDisplayMode: normalizedGemStatusDisplayMode,

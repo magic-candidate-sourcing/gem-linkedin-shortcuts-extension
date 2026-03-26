@@ -100,6 +100,11 @@ let profileIdentityCache = {
   gemCandidateId: "",
   resolvedAtMs: 0
 };
+const isLinkedInProfilePage = glsIsLinkedInProfilePage;
+const isLinkedInPublicProfilePage = glsIsLinkedInPublicProfilePage;
+const isLinkedInRecruiterProfilePage = glsIsLinkedInRecruiterProfilePage;
+const normalizeUrlForContext = glsNormalizeUrl;
+const normalizeLinkedInUrl = glsNormalizeUrl;
 
 window.__GLS_UNIFIED_CONTENT_ACTIVE__ = true;
 
@@ -232,22 +237,6 @@ function generateRunId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function isLinkedInPublicProfilePath(pathname) {
-  return /^\/(?:in|pub)\/[^/]+(?:\/.*)?$/.test(String(pathname || ""));
-}
-
-function isLinkedInRecruiterProfilePath(pathname) {
-  return /^\/talent\/(?:.*\/)?profile\/[^/]+(?:\/.*)?$/i.test(String(pathname || ""));
-}
-
-function isLinkedInProfilePath(pathname) {
-  return isLinkedInPublicProfilePath(pathname) || isLinkedInRecruiterProfilePath(pathname);
-}
-
-function isLinkedInHost(hostname) {
-  return /(^|\.)linkedin\.com$/i.test(String(hostname || ""));
-}
-
 function isGemHost(hostname) {
   return /(^|\.)gem\.com$/i.test(String(hostname || ""));
 }
@@ -266,38 +255,6 @@ function isGmailMailboxPath(pathname) {
 
 function isGemCandidateProfilePath(pathname) {
   return /^\/candidate\/[^/?#]+(?:\/.*)?$/i.test(String(pathname || ""));
-}
-
-function isLinkedInProfilePage() {
-  try {
-    const parsed = new URL(window.location.href);
-    if (!isLinkedInHost(parsed.hostname)) {
-      return false;
-    }
-    return isLinkedInProfilePath(parsed.pathname);
-  } catch (_error) {
-    return /^https:\/\/www\.linkedin\.com\/(?:(?:in|pub)\/[^/]+|talent\/(?:.*\/)?profile\/[^/]+)(?:\/.*)?$/i.test(
-      window.location.href
-    );
-  }
-}
-
-function isLinkedInPublicProfilePage() {
-  try {
-    const parsed = new URL(window.location.href);
-    return isLinkedInHost(parsed.hostname) && isLinkedInPublicProfilePath(parsed.pathname);
-  } catch (_error) {
-    return /^https:\/\/www\.linkedin\.com\/(?:in|pub)\/[^/]+(?:\/.*)?$/i.test(window.location.href);
-  }
-}
-
-function isLinkedInRecruiterProfilePage() {
-  try {
-    const parsed = new URL(window.location.href);
-    return isLinkedInHost(parsed.hostname) && isLinkedInRecruiterProfilePath(parsed.pathname);
-  } catch (_error) {
-    return /^https:\/\/www\.linkedin\.com\/talent\/(?:.*\/)?profile\/[^/]+(?:\/.*)?$/i.test(window.location.href);
-  }
 }
 
 function isBootstrapManagedLinkedInPage() {
@@ -459,34 +416,6 @@ function isSupportedActionPage() {
   return isLinkedInProfilePage() || isGemCandidateProfilePage() || isGmailThreadPage() || isGitHubProfilePage();
 }
 
-function normalizeUrlForContext(url, options = {}) {
-  const keepHash = Boolean(options.keepHash);
-  const keepSearch = Boolean(options.keepSearch);
-  const fallback = String(url || "").trim();
-  if (!fallback) {
-    return "";
-  }
-  try {
-    const parsed = new URL(fallback, window.location.origin);
-    if (!keepSearch) {
-      parsed.search = "";
-    }
-    if (!keepHash) {
-      parsed.hash = "";
-    }
-    return parsed.toString().replace(/\/$/, "");
-  } catch (_error) {
-    let normalized = fallback;
-    if (!keepSearch) {
-      normalized = normalized.replace(/\?.*$/, "");
-    }
-    if (!keepHash) {
-      normalized = normalized.replace(/#.*$/, "");
-    }
-    return normalized.replace(/\/$/, "");
-  }
-}
-
 function normalizePageUrlForWatcher(url = window.location.href) {
   try {
     const parsed = new URL(url, window.location.origin);
@@ -500,17 +429,6 @@ function normalizePageUrlForWatcher(url = window.location.href) {
   }
 }
 
-function normalizeLinkedInUrl(url) {
-  try {
-    const parsed = new URL(url);
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString().replace(/\/$/, "");
-  } catch (_error) {
-    return url;
-  }
-}
-
 function getLinkedInIdentityHelpers() {
   return window.__GLS_LINKEDIN_IDENTITY_HELPERS__ || {};
 }
@@ -521,15 +439,6 @@ function toCanonicalLinkedInPublicProfileUrl(rawUrl) {
 
 function getCurrentLinkedInPublicProfileUrl() {
   return toCanonicalLinkedInPublicProfileUrl(window.location.href);
-}
-
-function findLinkedInPublicProfileUrlInInlineScripts() {
-  return getLinkedInIdentityHelpers().findLinkedInPublicProfileUrlInInlineScripts?.({
-    document,
-    urlBase: window.location.origin,
-    maxScriptTextLength: 800000,
-    requireSignalPattern: true
-  }) || "";
 }
 
 function findLinkedInPublicProfileUrlInDom() {
