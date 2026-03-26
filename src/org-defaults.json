@@ -1,5 +1,5 @@
 {
-  "backendBaseUrl": "https://gem-linkedin-shortcuts-extension.onrender.com",
+  "backendBaseUrl": "https://gem-linkedin-shortcuts-extension.vercel.app",
   "backendSharedToken": "",
   "createdByUserId": "",
   "createdByUserEmail": "",

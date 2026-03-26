@@ -4,7 +4,7 @@ Chrome extension + backend service that lets you run Gem and Ashby workflows usi
 
 ## Core capabilities
 
-On supported profile pages, the extension provides a `Gem actions` launcher (`Cmd+K` by default) with:
+On supported pages, the extension provides a `Gem actions` launcher (`Cmd+K` by default) with:
 
 1. Create project
 2. Search project + navigate
@@ -15,6 +15,8 @@ Supported pages:
 
 - LinkedIn public and recruiter profile pages
 - Gem candidate profile pages
+- Gem project pages (for `Gem actions`)
+- Gmail thread pages
 - GitHub profile pages
 
 From a supported profile page, the extension can:
@@ -30,12 +32,13 @@ From a supported profile page, the extension can:
 9. Set a reminder (due date + optional note).
 10. Open sequence in Gem UI.
 11. Edit sequence in Gem UI.
+12. Show a persistent Gem `Status` signal on LinkedIn profile pages, with a user on/off toggle in popup/options.
 
 ## Recommended org rollout (non-forced, install-from-link)
 
 This is the easiest path if you want users to click a link, install once, and use immediately:
 
-1. Deploy `backend/server.js` to a stable HTTPS URL (for example `https://api.rebuilding-gem.com`).
+1. Deploy this repo to Vercel and use the production backend URL (default in this repo: `https://gem-linkedin-shortcuts-extension.vercel.app`).
 2. Configure backend secrets in deployment env vars (`GEM_API_KEY`, `ASHBY_API_KEY`, etc).
    - Leave `GEM_DEFAULT_USER_ID` and `GEM_DEFAULT_USER_EMAIL` empty for multi-user org setup.
    - Each user selects themselves in extension Options using the built-in "Load Users" picker.
@@ -47,11 +50,37 @@ This is the easiest path if you want users to click a link, install once, and us
    - `backendSharedToken`: leave empty for Chrome Web Store builds
    - leave `createdByUserId`/`createdByUserEmail` empty so users can pick their own Gem account
    - optional defaults for project/sequence/custom field IDs
-4. Ensure `manifest.json` includes your backend origin in `host_permissions` before packaging if you change away from the default hosted backend or localhost dev origins.
+4. Ensure `manifest.json` includes your backend origin in `host_permissions` before packaging if you change away from the default Vercel backend or localhost dev origins.
 5. Publish in Chrome Web Store as unlisted/private and share the install link.
-6. Use `https://<your-backend-domain>/privacy` as Chrome Web Store privacy policy URL.
+6. Use `https://gem-linkedin-shortcuts-extension.vercel.app/privacy` as Chrome Web Store privacy policy URL, unless you intentionally change the production backend domain.
 
 The extension now auto-applies `src/org-defaults.json` on install/startup, so users do not need to open options or use terminal.
+
+## Vercel deployment
+
+The backend now targets Vercel production by default:
+
+- Production backend URL: `https://gem-linkedin-shortcuts-extension.vercel.app`
+- Stable public routes remain the same: `/api/*`, `/health`, and `/privacy`
+- Chrome Web Store builds should only allow the stable production URL, not Vercel preview URLs
+- On Vercel, backend file logs are best-effort and live under `/tmp`, so durable debugging should come from Vercel Function/Runtime Logs
+
+Deployment checklist:
+
+1. Import the repo into Vercel.
+2. Set production env vars:
+   - required: `GEM_API_KEY`
+   - recommended for published extension builds: `ALLOWED_EXTENSION_ORIGINS=chrome-extension://<published_extension_id>`
+   - optional Gem defaults: `GEM_DEFAULT_USER_ID`, `GEM_DEFAULT_USER_EMAIL`
+   - optional Ashby: `ASHBY_API_KEY`, `ASHBY_WRITE_ENABLED`, `ASHBY_WRITE_CONFIRMATION_TOKEN`, `ASHBY_WRITE_REQUIRE_CONFIRMATION`
+   - optional manual-install fallback: `BACKEND_SHARED_TOKEN`
+3. Deploy to production.
+4. Verify:
+   - `https://gem-linkedin-shortcuts-extension.vercel.app/health`
+   - `https://gem-linkedin-shortcuts-extension.vercel.app/privacy`
+5. Load the unpacked extension or package a release and confirm action flows hit the Vercel backend.
+
+For a fuller deployment checklist, see `docs/vercel-deployment.md`.
 
 Build upload zip for Chrome Web Store:
 
@@ -63,6 +92,7 @@ Chrome Web Store copy/template files:
 - `docs/chrome-web-store-listing.md`
 - `docs/privacy-policy.md`
 - `docs/chrome-web-store-review-checklist.md`
+- `docs/vercel-deployment.md`
 
 ## Local quick start (developer setup)
 
@@ -155,7 +185,7 @@ If `warnings` includes `ASHBY_WRITE_CONFIRMATION_TOKEN is not set`, the backend 
 4. Select the repo root folder (`gem-linkedin-shortcuts-extension`)
 5. Refresh the loaded extension
 6. (Recommended) Click **Keyboard shortcuts** -> Set a shortcut for activating the extension (I use cmd + g)
-7. Open a supported profile page (LinkedIn, Gem candidate, or GitHub)
+7. Open a supported page (LinkedIn, Gem candidate/project, Gmail thread, or GitHub)
 8. Activate the extension -> click "open options"
 9. If backend token auth is enabled for your private deployment, set the same token in extension options (`Backend Shared Token`) and backend `.env` (`BACKEND_SHARED_TOKEN`).
 10. Refresh the extension again and reload the supported profile tab
@@ -183,22 +213,27 @@ If `warnings` includes `ASHBY_WRITE_CONFIRMATION_TOKEN is not set`, the backend 
 - If you see `Could not load projects: Unauthorized`, check whether `BACKEND_SHARED_TOKEN` is set in `backend/.env`.
 - If it is set, the same token must be entered in extension **Options** (`Backend Shared Token`).
 - If you use `ALLOWED_EXTENSION_ORIGINS`, confirm it includes your published `chrome-extension://<extension-id>` origin.
-- If you moved backend off localhost or the default hosted backend, confirm `manifest.json` has your backend domain in `host_permissions` before packaging.
+- If you moved backend off localhost or the default Vercel backend, confirm `manifest.json` has your backend domain in `host_permissions` before packaging.
+- If backend logs look empty on Vercel, remember `/api/logs/recent` is best-effort and may reset on cold starts; check Vercel Runtime Logs for durable backend visibility.
+- Gmail matching now uses the visible thread participants as the primary signal and can optionally enrich that with the Gmail API.
+- To enable Gmail API enrichment, add an `oauth2` client ID for this extension in `manifest.json` and request `https://www.googleapis.com/auth/gmail.readonly`.
 
 ## Local vs Chrome Web Store auth
 
 - Local unpacked development and the Chrome Web Store build can use different backend auth paths.
 - Local development can keep using `http://localhost:8787` and either a shared token or your unpacked extension origin in `ALLOWED_EXTENSION_ORIGINS`.
-- Chrome Web Store builds should keep `src/org-defaults.json` tokenless and authorize the published `chrome-extension://<extension-id>` origin on the backend instead.
+- Chrome Web Store builds should keep `src/org-defaults.json` tokenless and authorize the published `chrome-extension://<extension-id>` origin on the Vercel backend instead.
+- Packaged builds should not target Vercel preview URLs; only the stable production origin should be allowed.
 
 ## Architecture and security model
 
 - Extension never stores Gem/Ashby API keys.
 - Chrome Web Store builds should not ship org-wide backend shared tokens in `src/org-defaults.json`.
-- Backend reads secrets from `backend/.env`
+- Local backend reads secrets from `backend/.env`; Vercel production reads them from Vercel project env vars.
 - Backend only exposes allowlisted action routes (not a generic proxy).
 - Backend shared-token auth (`X-Backend-Token`) and extension-origin allowlisting can gate backend routes.
 - Backend and extension logs redact token/key/secret/password-like fields.
+- Vercel deployments treat in-memory caches and `/tmp` logs as disposable warm-instance optimizations, not durable storage.
 
 ## Org defaults file
 
