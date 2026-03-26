@@ -11767,18 +11767,68 @@ function restoreViewportState(state) {
   });
 }
 
-function clickWithoutViewportJump(control, viewportState) {
+function captureActiveElementState() {
+  const activeElement = document.activeElement;
+  if (
+    !activeElement ||
+    activeElement === document.body ||
+    activeElement === document.documentElement ||
+    typeof activeElement.focus !== "function"
+  ) {
+    return null;
+  }
+  const selectionStart = typeof activeElement.selectionStart === "number" ? activeElement.selectionStart : null;
+  const selectionEnd = typeof activeElement.selectionEnd === "number" ? activeElement.selectionEnd : null;
+  return {
+    element: activeElement,
+    selectionStart,
+    selectionEnd
+  };
+}
+
+function restoreActiveElementState(state) {
+  const currentActiveElement = document.activeElement;
+  const targetElement = state?.element;
+  if (targetElement && targetElement.isConnected && typeof targetElement.focus === "function") {
+    try {
+      targetElement.focus({ preventScroll: true });
+    } catch (_error) {
+      // Ignore focus restore failures and fall through to best-effort cleanup below.
+    }
+    if (
+      typeof state?.selectionStart === "number" &&
+      typeof state?.selectionEnd === "number" &&
+      typeof targetElement.setSelectionRange === "function"
+    ) {
+      try {
+        targetElement.setSelectionRange(state.selectionStart, state.selectionEnd);
+      } catch (_error) {
+        // Ignore selection restore failures.
+      }
+    }
+    return;
+  }
+  if (
+    currentActiveElement &&
+    currentActiveElement !== document.body &&
+    currentActiveElement !== document.documentElement &&
+    typeof currentActiveElement.blur === "function"
+  ) {
+    try {
+      currentActiveElement.blur();
+    } catch (_error) {
+      // Ignore blur failures.
+    }
+  }
+}
+
+function clickWithoutViewportJump(control, viewportState, activeElementState) {
   if (!control) {
     return;
   }
-  if (typeof control.focus === "function") {
-    try {
-      control.focus({ preventScroll: true });
-    } catch (_error) {
-      // Ignore focus failures on non-focusable controls.
-    }
-  }
   control.click();
+  restoreViewportState(viewportState);
+  restoreActiveElementState(activeElementState);
   restoreViewportState(viewportState);
 }
 
@@ -11808,6 +11858,7 @@ async function triggerExpandEllipsisMoreShortcut(
     scrollPosition: getWindowScrollPosition(),
     anchor: captureViewportAnchor()
   };
+  const activeElementState = captureActiveElementState();
   const clickedControls = new Set();
   let clickedCount = 0;
   let passCount = 0;
@@ -11819,13 +11870,16 @@ async function triggerExpandEllipsisMoreShortcut(
     }
     for (const control of nextControls) {
       clickedControls.add(control);
-      clickWithoutViewportJump(control, viewportState);
+      clickWithoutViewportJump(control, viewportState, activeElementState);
       clickedCount += 1;
     }
+    restoreActiveElementState(activeElementState);
     restoreViewportState(viewportState);
     await waitFor(LINKEDIN_EXPAND_MORE_PASS_DELAY_MS);
+    restoreActiveElementState(activeElementState);
     restoreViewportState(viewportState);
   }
+  restoreActiveElementState(activeElementState);
   restoreViewportState(viewportState);
 
   if (clickedCount > 0) {
