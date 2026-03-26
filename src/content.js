@@ -10966,11 +10966,65 @@ function isInsideLinkedInActivitySection(element) {
   return false;
 }
 
+function getProfileSectionRootForHeading(headingElement) {
+  if (!headingElement) {
+    return null;
+  }
+  return headingElement.closest("section, article") || headingElement.parentElement || null;
+}
+
+function findVisibleProfileSectionRootByHeadingMatcher(matcher, root = document.querySelector("main")) {
+  if (!root || typeof root.querySelectorAll !== "function" || typeof matcher !== "function") {
+    return null;
+  }
+
+  const headings = Array.from(root.querySelectorAll("h1, h2, h3, h4")).filter((candidate) => {
+    if (!candidate || !isElementVisible(candidate)) {
+      return false;
+    }
+    if (candidate.closest("header, nav, aside, footer")) {
+      return false;
+    }
+    if (isInsideRecommendationModule(candidate)) {
+      return false;
+    }
+    return matcher(normalizeProfileActionLabel(candidate.textContent || ""), candidate);
+  });
+  if (headings.length === 0) {
+    return null;
+  }
+
+  headings.sort((left, right) => {
+    const leftRect = left.getBoundingClientRect();
+    const rightRect = right.getBoundingClientRect();
+    if (Math.abs(leftRect.top - rightRect.top) > 1) {
+      return leftRect.top - rightRect.top;
+    }
+    return leftRect.left - rightRect.left;
+  });
+  return getProfileSectionRootForHeading(headings[0]);
+}
+
+function getProfileAboutSectionRoot() {
+  return findVisibleProfileSectionRootByHeadingMatcher((label) => label === "about" || label.startsWith("about "));
+}
+
+function isNodeBeforeReferenceInDom(node, referenceNode) {
+  if (!node || !referenceNode || typeof node.compareDocumentPosition !== "function") {
+    return true;
+  }
+  if (node === referenceNode || node.contains(referenceNode)) {
+    return false;
+  }
+  return Boolean(node.compareDocumentPosition(referenceNode) & Node.DOCUMENT_POSITION_FOLLOWING);
+}
+
 function findVisibleProfileActionControl(root = document, options = {}) {
   if (!root || typeof root.querySelectorAll !== "function") {
     return null;
   }
   const headingRect = options.headingRect || null;
+  const beforeElement = options.beforeElement || null;
   const skipHeadingBand = Boolean(options.skipHeadingBand);
   const matcher = typeof options.matcher === "function" ? options.matcher : null;
   if (!matcher) {
@@ -10986,6 +11040,9 @@ function findVisibleProfileActionControl(root = document, options = {}) {
       continue;
     }
     if (isInsideRecommendationModule(candidate)) {
+      continue;
+    }
+    if (beforeElement && !isNodeBeforeReferenceInDom(candidate, beforeElement)) {
       continue;
     }
     if (!skipHeadingBand && !isElementInProfileActionBand(candidate, headingRect)) {
@@ -11029,6 +11086,7 @@ function findVisibleConnectControl(root = document, options = {}) {
 
 function findVisibleMoreControl(root = document, options = {}) {
   const headingRect = options.headingRect || null;
+  const beforeElement = options.beforeElement || null;
   const selectors = [
     "button",
     "a[role='button']",
@@ -11040,6 +11098,9 @@ function findVisibleMoreControl(root = document, options = {}) {
       continue;
     }
     if (isInsideRecommendationModule(candidate)) {
+      continue;
+    }
+    if (beforeElement && !isNodeBeforeReferenceInDom(candidate, beforeElement)) {
       continue;
     }
     if (!isElementInProfileActionBand(candidate, headingRect)) {
@@ -11066,6 +11127,7 @@ function getProfileTopCardRoot(headingElement, headingRect) {
   if (!headingElement) {
     return null;
   }
+  const aboutSectionRoot = getProfileAboutSectionRoot();
 
   const knownContainers = [
     ".pv-top-card-v2-ctas",
@@ -11073,13 +11135,33 @@ function getProfileTopCardRoot(headingElement, headingRect) {
     ".pvs-profile-actions",
     ".pvs-profile-header__actions"
   ];
+  const knownContainerCandidates = [];
   for (const selector of knownContainers) {
-    const node = document.querySelector(`main ${selector}`);
-    if (!node) {
-      continue;
+    for (const node of document.querySelectorAll(`main ${selector}`)) {
+      if (!node || knownContainerCandidates.includes(node)) {
+        continue;
+      }
+      if (isInsideRecommendationModule(node)) {
+        continue;
+      }
+      if (aboutSectionRoot && !isNodeBeforeReferenceInDom(node, aboutSectionRoot) && !node.contains(headingElement)) {
+        continue;
+      }
+      knownContainerCandidates.push(node);
     }
-    let rootCandidate = node.closest("section, article, main") || node.parentElement;
-    while (rootCandidate && rootCandidate !== document.body) {
+  }
+  if (headingRect && knownContainerCandidates.length > 1) {
+    const headingCenter = {
+      x: headingRect.left + headingRect.width / 2,
+      y: headingRect.top + headingRect.height / 2
+    };
+    knownContainerCandidates.sort(
+      (left, right) => getDistance(getNodeCenter(left), headingCenter) - getDistance(getNodeCenter(right), headingCenter)
+    );
+  }
+  for (const node of knownContainerCandidates) {
+    let rootCandidate = node.closest("section, article") || node.parentElement;
+    while (rootCandidate && rootCandidate !== document.body && rootCandidate.tagName !== "MAIN") {
       if (rootCandidate.contains(headingElement)) {
         return rootCandidate;
       }
@@ -11109,13 +11191,17 @@ function getProfileTopCardRoot(headingElement, headingRect) {
     cursor = cursor.parentElement;
   }
 
-  return headingElement.closest("section") || headingElement.parentElement || null;
+  const fallbackRoot = getProfileSectionRootForHeading(headingElement);
+  if (fallbackRoot && (!aboutSectionRoot || isNodeBeforeReferenceInDom(fallbackRoot, aboutSectionRoot))) {
+    return fallbackRoot;
+  }
+  return headingElement.parentElement || null;
 }
 
 function getProfileActionSearchRoots(topCardRoot) {
   const roots = [];
   const mainRoot = document.querySelector("main");
-  [topCardRoot, mainRoot, document].forEach((candidate) => {
+  [topCardRoot, mainRoot].forEach((candidate) => {
     if (!candidate || typeof candidate.querySelectorAll !== "function") {
       return;
     }
@@ -11123,6 +11209,9 @@ function getProfileActionSearchRoots(topCardRoot) {
       roots.push(candidate);
     }
   });
+  if (roots.length === 0 && typeof document.querySelectorAll === "function") {
+    roots.push(document);
+  }
   return roots;
 }
 
@@ -11266,6 +11355,7 @@ async function waitForProfileActionInMenuForControl(moreControl, findOptions = {
 async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinkedInShortcutLabel(LINKEDIN_SHORTCUT_IDS.CONNECT)) {
   const { headingElement, headingRect } = await waitForProfileHeading();
   const headingFound = Boolean(headingElement && headingRect);
+  const aboutSectionRoot = headingFound ? getProfileAboutSectionRoot() : null;
   markLastLinkedInActionDiagnosticsForPage({
     action: "connect",
     stage: "start",
@@ -11286,6 +11376,7 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
   });
   const directConnect = findVisibleProfileActionControlAcrossRoots(searchRoots, {
     headingRect,
+    beforeElement: aboutSectionRoot,
     matcher: (label) => isConnectLabel(label),
     selectors: [
       "a",
@@ -11328,6 +11419,7 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
 
   const pendingConnect = findVisibleProfileActionControlAcrossRoots(searchRoots, {
     headingRect,
+    beforeElement: aboutSectionRoot,
     matcher: (label) => isPendingConnectLabel(label),
     selectors: [
       "a",
@@ -11366,7 +11458,10 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
     return;
   }
 
-  const moreControl = findVisibleMoreControlAcrossRoots(searchRoots, { headingRect });
+  const moreControl = findVisibleMoreControlAcrossRoots(searchRoots, {
+    headingRect,
+    beforeElement: aboutSectionRoot
+  });
   if (!moreControl) {
     markLastLinkedInActionDiagnosticsForPage({
       action: "connect",
@@ -11385,7 +11480,7 @@ async function triggerConnectShortcut(runId, shortcutLabel = getConfiguredLinked
       message: topCardRoot
         ? "Could not find direct Connect button or More actions menu."
         : headingFound
-          ? "Could not resolve top-card root and document-wide fallback did not find Connect or More."
+          ? "Could not resolve top-card root and fallback action search did not find Connect or More."
           : "Heading was unavailable and fallback action search did not find Connect or More.",
       link: window.location.href,
       details: {
@@ -11500,6 +11595,7 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
   ];
   const { headingElement, headingRect } = await waitForProfileHeading();
   const headingFound = Boolean(headingElement && headingRect);
+  const aboutSectionRoot = headingFound ? getProfileAboutSectionRoot() : null;
   markLastLinkedInActionDiagnosticsForPage({
     action,
     stage: "start",
@@ -11520,6 +11616,7 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
   });
   const directAction = findVisibleProfileActionControlAcrossRoots(searchRoots, {
     headingRect,
+    beforeElement: aboutSectionRoot,
     matcher,
     selectors
   });
@@ -11552,7 +11649,10 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
     return;
   }
 
-  const moreControl = findVisibleMoreControlAcrossRoots(searchRoots, { headingRect });
+  const moreControl = findVisibleMoreControlAcrossRoots(searchRoots, {
+    headingRect,
+    beforeElement: aboutSectionRoot
+  });
   if (!moreControl) {
     markLastLinkedInActionDiagnosticsForPage({
       action,
@@ -11571,7 +11671,7 @@ async function triggerLinkedInPublicProfileActionShortcut(runId, actionConfig) {
       message: topCardRoot
         ? `Could not find direct action or More menu for "${action}".`
         : headingFound
-          ? `Could not resolve top-card root and document-wide fallback did not find "${action}" or More.`
+          ? `Could not resolve top-card root and fallback action search did not find "${action}" or More.`
           : `Heading was unavailable and fallback action search did not find "${action}" or More.`,
       link: window.location.href,
       details: {
