@@ -3657,8 +3657,9 @@ async function prefetchCustomFieldsForContext(settings, context, runId, options 
     forceFreshLookup: Boolean(options.forceFreshLookup)
   });
   if (!candidateId) {
+    let customFields = [];
     try {
-      await callBackend(
+      const catalog = await callBackend(
         "/api/custom-fields/list",
         {
           limit: 0,
@@ -3667,13 +3668,14 @@ async function prefetchCustomFieldsForContext(settings, context, runId, options 
         settings,
         { ...audit, step: "warmCustomFieldCatalog" }
       );
+      customFields = Array.isArray(catalog?.customFields) ? catalog.customFields : [];
     } catch (_error) {
       // Best-effort warm-up only. The interactive load path will still fetch on demand.
     }
-    await setCachedCustomFieldsForContext(context, "", [], { candidateProjectIds: [] });
+    await setCachedCustomFieldsForContext(context, "", customFields, { candidateProjectIds: [] });
     return {
       candidateId: "",
-      customFields: [],
+      customFields,
       statusLabels: [],
       candidateProjectIds: []
     };
@@ -3739,14 +3741,18 @@ async function listCustomFieldsForContext(settings, context, runId, options = {}
   const forceRefresh = Boolean(options.forceRefresh);
   const allowCreate = options.allowCreate !== false;
   const allowEmptyCandidateCache = Boolean(options.allowEmptyCandidateCache);
+  const refreshInBackground = options.refreshInBackground !== false;
   const actionId = ACTIONS.SET_CUSTOM_FIELD;
 
   const cached = await getCachedCustomFieldsForContext(context);
   const cachedCandidateId = String(cached.entry?.candidateId || "").trim();
   const hasUsableCachedEntry = Boolean(cached.entry && (cachedCandidateId || allowEmptyCandidateCache));
   if (!forceRefresh && hasUsableCachedEntry) {
-    if (!cached.isFresh) {
-      ensureCustomFieldRefresh(settings, context, runId, { allowCreate }).catch(() => {});
+    if (refreshInBackground && (!cached.isFresh || !cachedCandidateId)) {
+      ensureCustomFieldRefresh(settings, context, runId, {
+        allowCreate,
+        forceRefresh: Boolean(!cachedCandidateId)
+      }).catch(() => {});
     }
     logEvent(settings, {
       event: "custom_fields.list.loaded",
@@ -4444,7 +4450,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           preferCache: Boolean(message.preferCache),
           refreshInBackground: message.refreshInBackground !== false,
           forceRefresh: Boolean(message.forceRefresh),
-          allowCreate: message.allowCreate !== false
+          allowCreate: message.allowCreate !== false,
+          allowEmptyCandidateCache: Boolean(message.allowEmptyCandidateCache)
         });
         sendResponse({
           ok: true,

@@ -1536,7 +1536,8 @@ function listCustomFieldsForContext(context, runId, options = {}) {
         preferCache: Boolean(options.preferCache),
         refreshInBackground: options.refreshInBackground !== false,
         forceRefresh: Boolean(options.forceRefresh),
-        allowCreate: options.allowCreate !== false
+        allowCreate: options.allowCreate !== false,
+        allowEmptyCandidateCache: Boolean(options.allowEmptyCandidateCache)
       },
       (response) => {
         if (chrome.runtime.lastError) {
@@ -2397,7 +2398,8 @@ function warmCustomFieldsForContext(context, runId, options = {}) {
     return Promise.resolve(null);
   }
   const allowCreate = options.allowCreate !== false;
-  const key = `${baseKey}|${allowCreate ? "create" : "nocreate"}`;
+  const allowEmptyCandidateCache = Boolean(options.allowEmptyCandidateCache);
+  const key = `${baseKey}|${allowCreate ? "create" : "nocreate"}|${allowEmptyCandidateCache ? "allow-empty" : "candidate-only"}`;
   if (!options.forceRefresh) {
     const existingPromise = customFieldWarmPromises.get(key);
     if (existingPromise) {
@@ -2409,7 +2411,8 @@ function warmCustomFieldsForContext(context, runId, options = {}) {
     preferCache: options.preferCache !== false,
     refreshInBackground: options.refreshInBackground !== false,
     forceRefresh: Boolean(options.forceRefresh),
-    allowCreate
+    allowCreate,
+    allowEmptyCandidateCache
   })
     .then((data) => {
       setCustomFieldMemoryEntry(context, data);
@@ -3361,7 +3364,8 @@ function prefetchPickersForCurrentProfile() {
   warmCustomFieldsForContext(profileContext, generateRunId(), {
     preferCache: true,
     refreshInBackground: true,
-    allowCreate: false
+    allowCreate: false,
+    allowEmptyCandidateCache: true
   }).catch(() => {});
   if (isLinkedInContext) {
     return;
@@ -5868,16 +5872,71 @@ async function showCustomFieldPicker(runId, context) {
       link: linkedinUrl
     });
 
+    const canCreateCandidateForPicker = shouldAllowCandidateCreateForContext(context);
+
+    async function surfaceCustomFieldLoadFailure(message) {
+      if (!pickerActive) {
+        return;
+      }
+      loading = false;
+      loadError = message || "Failed to load custom fields.";
+      renderFields();
+      showToast(loadError, true);
+      await logEvent({
+        source: "extension.content",
+        level: "error",
+        event: "custom_field_picker.load_failed",
+        actionId: ACTIONS.SET_CUSTOM_FIELD,
+        runId,
+        message: loadError,
+        link: linkedinUrl
+      });
+    }
+
+    function maybeUpgradeCustomFieldsForCandidate(seedData = null, options = {}) {
+      const seedCandidateId = String(seedData?.candidateId || currentCandidateId || "").trim();
+      if (!pickerActive || !canCreateCandidateForPicker || seedCandidateId) {
+        return Promise.resolve(false);
+      }
+      return warmCustomFieldsForContext(context, runId, {
+        preferCache: true,
+        refreshInBackground: false,
+        allowCreate: true
+      })
+        .then((candidateData) => {
+          if (!pickerActive || !candidateData) {
+            return false;
+          }
+          const resolvedCandidateId = String(candidateData.candidateId || "").trim();
+          if (!resolvedCandidateId) {
+            return false;
+          }
+          applyLoadedCustomFields(candidateData);
+          return true;
+        })
+        .catch(async (error) => {
+          if (options.surfaceFailure) {
+            await surfaceCustomFieldLoadFailure(error?.message || "Failed to load custom fields.");
+          }
+          // The fast picker path is already visible. Ignore candidate-upgrade failures here
+          // and let the eventual field update action surface any real backend error.
+          return false;
+        });
+    }
+
     warmCustomFieldsForContext(context, runId, {
       preferCache: true,
       refreshInBackground: true,
-      allowCreate: shouldAllowCandidateCreateForContext(context)
+      allowCreate: false,
+      allowEmptyCandidateCache: true
     })
       .then(async (data) => {
         if (!data) {
+          maybeUpgradeCustomFieldsForCandidate();
           return;
         }
         applyLoadedCustomFields(data);
+        maybeUpgradeCustomFieldsForCandidate(data);
         await logEvent({
           source: "extension.content",
           event: "custom_field_picker.loaded",
@@ -5897,19 +5956,14 @@ async function showCustomFieldPicker(runId, context) {
         if (!pickerActive) {
           return;
         }
-        loading = false;
-        loadError = error.message || "Failed to load custom fields.";
-        renderFields();
-        showToast(loadError, true);
-        await logEvent({
-          source: "extension.content",
-          level: "error",
-          event: "custom_field_picker.load_failed",
-          actionId: ACTIONS.SET_CUSTOM_FIELD,
-          runId,
-          message: loadError,
-          link: linkedinUrl
-        });
+        if (canCreateCandidateForPicker) {
+          const upgraded = await maybeUpgradeCustomFieldsForCandidate(null, { surfaceFailure: true });
+          if (upgraded) {
+            return;
+          }
+          return;
+        }
+        await surfaceCustomFieldLoadFailure(error.message || "Failed to load custom fields.");
       });
   });
 }
@@ -9910,7 +9964,8 @@ async function getRuntimeContext(actionId, settings, runId) {
     warmCustomFieldsForContext(context, runId, {
       preferCache: true,
       refreshInBackground: true,
-      allowCreate: shouldAllowCandidateCreateForContext(context)
+      allowCreate: false,
+      allowEmptyCandidateCache: true
     }).catch(() => {});
     const selection = await showCustomFieldPicker(runId, context);
     if (!selection) {

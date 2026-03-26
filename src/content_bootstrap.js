@@ -29,6 +29,8 @@
   }
 
   const PAGE_CHANGE_POLL_INTERVAL_MS = 300;
+  const CUSTOM_FIELD_WARM_IDLE_TIMEOUT_MS = 1800;
+  const CUSTOM_FIELD_WARM_FALLBACK_DELAY_MS = 450;
   const INVITE_DECISION_TIMEOUT_MS = 1200;
   const INVITE_DECISION_POLL_INTERVAL_MS = 50;
   const ACTIVE_RUNTIME_FILES = ["src/content.js"];
@@ -37,7 +39,10 @@
   const state = {
     cachedSettings: null,
     contextRecoveryTriggered: false,
+    customFieldWarmIdleId: 0,
+    customFieldWarmTimerId: 0,
     initialized: false,
+    lastCustomFieldWarmKey: "",
     pageUrl: "",
     passiveRuntimeEnsured: false,
     passiveRuntimeEnsurePromise: null,
@@ -96,6 +101,17 @@
     }
     window.clearTimeout(state.pageChangeTimerId);
     state.pageChangeTimerId = 0;
+  }
+
+  function clearPendingCustomFieldWarm() {
+    if (state.customFieldWarmTimerId) {
+      window.clearTimeout(state.customFieldWarmTimerId);
+      state.customFieldWarmTimerId = 0;
+    }
+    if (state.customFieldWarmIdleId && typeof window.cancelIdleCallback === "function") {
+      window.cancelIdleCallback(state.customFieldWarmIdleId);
+      state.customFieldWarmIdleId = 0;
+    }
   }
 
   function getBootstrapEventShortcutCandidates(event) {
@@ -696,6 +712,94 @@
     );
   }
 
+  function shouldWarmCustomFieldsInBootstrap() {
+    return Boolean(
+      state.cachedSettings?.enabled &&
+      glsIsLinkedInProfilePage() &&
+      !state.runtimeEnsured &&
+      !isContentRuntimeReadyLocally()
+    );
+  }
+
+  function buildLinkedInCustomFieldWarmKey(context) {
+    if (!context || typeof context !== "object") {
+      return "";
+    }
+    const pageUrl = glsNormalizePageUrl(context.pageUrl || window.location.href);
+    const linkedinUrl = glsNormalizeUrl(context.linkedinUrl || "");
+    const linkedInHandle = String(context.linkedInHandle || "").trim().toLowerCase();
+    if (!pageUrl || (!linkedinUrl && !linkedInHandle)) {
+      return "";
+    }
+    return [pageUrl, linkedinUrl, linkedInHandle].join("|");
+  }
+
+  function warmCustomFieldsForCurrentLinkedInProfile(reason = "") {
+    if (!shouldWarmCustomFieldsInBootstrap() || document.visibilityState === "hidden") {
+      return false;
+    }
+    const context = getLinkedInDebugContext();
+    if (!String(context.linkedinUrl || "").trim() && !String(context.linkedInHandle || "").trim()) {
+      return false;
+    }
+    const warmKey = buildLinkedInCustomFieldWarmKey(context);
+    if (!warmKey || state.lastCustomFieldWarmKey === warmKey) {
+      return Boolean(warmKey);
+    }
+    state.lastCustomFieldWarmKey = warmKey;
+    sendRuntimeMessage({
+      type: "LIST_CUSTOM_FIELDS_FOR_CONTEXT",
+      context,
+      runId:
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      preferCache: true,
+      refreshInBackground: true,
+      allowCreate: false,
+      allowEmptyCandidateCache: true,
+      warmReason: reason || "bootstrap-prefetch"
+    })
+      .then((response) => {
+        if (response?.ok) {
+          return;
+        }
+        if (state.lastCustomFieldWarmKey === warmKey) {
+          state.lastCustomFieldWarmKey = "";
+        }
+      })
+      .catch(() => {
+        if (state.lastCustomFieldWarmKey === warmKey) {
+          state.lastCustomFieldWarmKey = "";
+        }
+      });
+    return true;
+  }
+
+  function scheduleCustomFieldWarm(reason = "", options = {}) {
+    clearPendingCustomFieldWarm();
+    if (!shouldWarmCustomFieldsInBootstrap()) {
+      return;
+    }
+    const delayMs = Math.max(0, Number(options.delayMs) || 0);
+    const run = () => {
+      state.customFieldWarmTimerId = 0;
+      state.customFieldWarmIdleId = 0;
+      warmCustomFieldsForCurrentLinkedInProfile(reason);
+    };
+    if (delayMs > 0) {
+      state.customFieldWarmTimerId = window.setTimeout(run, delayMs);
+      return;
+    }
+    if (typeof window.requestIdleCallback === "function") {
+      state.customFieldWarmIdleId = window.requestIdleCallback(run, {
+        timeout: CUSTOM_FIELD_WARM_IDLE_TIMEOUT_MS
+      });
+      return;
+    }
+    state.customFieldWarmTimerId = window.setTimeout(run, CUSTOM_FIELD_WARM_FALLBACK_DELAY_MS);
+  }
+
   function scheduleBannerRuntimeEnsure(reason, options = {}) {
     if (!shouldEnsureBannerRuntime()) {
       clearPendingPassiveRuntimeEnsure();
@@ -720,6 +824,7 @@
     const hasRuntimeListener = state.runtimeEnsured || state.passiveRuntimeEnsured || isPassiveRuntimeReadyLocally();
     if (!glsIsLinkedInProfilePage()) {
       clearPendingPassiveRuntimeEnsure();
+      clearPendingCustomFieldWarm();
       if (hasRuntimeListener) {
         dispatchDeferredRuntimeEvent("gls:linkedin-page-changed", {
           reason,
@@ -728,6 +833,8 @@
       }
       return;
     }
+
+    scheduleCustomFieldWarm(reason);
 
     if (hasRuntimeListener) {
       dispatchDeferredRuntimeEvent("gls:linkedin-page-changed", {
@@ -851,6 +958,11 @@
   function handleSettingsUpdatedMessage(message, sendResponse) {
     state.cachedSettings = normalizeSettings(message.settings || {});
     markConfiguredShortcutDiagnosticsForPage();
+    if (state.cachedSettings.enabled && glsIsLinkedInProfilePage()) {
+      scheduleCustomFieldWarm("settings-updated");
+    } else {
+      clearPendingCustomFieldWarm();
+    }
     const finish = () => {
       dispatchDeferredRuntimeEvent("gls:settings-updated", {
         settings: state.cachedSettings
@@ -864,6 +976,7 @@
       return true;
     }
     clearPendingPassiveRuntimeEnsure();
+    clearPendingCustomFieldWarm();
     finish();
     return false;
   }
@@ -1003,6 +1116,7 @@
     if (shouldEnsureBannerRuntime()) {
       scheduleBannerRuntimeEnsure("initial-status");
     }
+    scheduleCustomFieldWarm("initial-custom-fields");
   }
 
   window.__GLS_LINKEDIN_BOOTSTRAP__ = {
